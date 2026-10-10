@@ -39,6 +39,8 @@ in the user's platform-specific config directory when running a packaged build.
 
 Choose a suggested city or search for any place by name. Open **World Settings** before loading the map to change density, zombie behavior, starting resources, and automatic collapse detection. Save multiple named scenarios and select one later. Map requests need internet access. Overture data is fetched on demand and may take longer than the OSM street query. Map attribution is shown in-game. OSM data is available under the Open Database License; Overture Maps data is available under the Overture Maps Foundation's terms.
 
+Map panels preserve the selected area's geographic aspect ratio instead of stretching it to fill each panel. Water polygons, coastlines, and open waterways are handled as separate geometry, and road/building detail scales with the ground area shown.
+
 ## Population model
 
 The selected-area radius defaults to 1.5 km and is adjustable from 0.35 to 2 km around the geocoded place center. DEADGRID requests the place's OSM population tag and boundary, then estimates the selected area's population using the circle's share of the named place's bounding-box area. This is an area-share estimate, not a census for the exact circle; it assumes even population density within the named place. If a place has no population tag, its Overture/OSM building count multiplied by an 18-residents-per-footprint assumption provides a clearly labeled rough fallback. The briefing reports the data source and estimated area population.
@@ -53,7 +55,7 @@ Zombies route through connected street waypoints and intersections toward popula
 
 - During deployment, click an asset on the right and click the map to place it. Keys `1`–`6` select the original ground assets.
 - In the briefing, search for a place to open its area-selection map. Click to position the operation, set its radius, use the mouse wheel or `+`/`−` to zoom, right-drag to pan, then choose **Use This Area**. Only the selected area is converted into the deployed map.
-- Press `F10` to toggle a 1080p window and `F11` to toggle fullscreen. **World Settings** configures density, behavior, resources, auto-collapse, and named scenario saves.
+- The game opens in a 1920×1080 window by default. Press `F10` to switch to the compact window size or back to 1080p, and `F11` to toggle fullscreen. **World Settings** configures density, behavior, resources, auto-collapse, and named scenario saves.
 - During deployment, use **Set Outbreak Origin** to place Patient Zero.
 - Start the simulation; it continues until you stop it or optional collapse detection triggers when at most 2% of residents remain.
 - Click **Stop Simulation** to open the analysis view. Restart the same scenario or return to parameters; a contained outbreak remains live until you choose.
