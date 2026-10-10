@@ -1,5 +1,7 @@
 # DEADGRID
 
+![DEADGRID logo](DeadGrid_%20Gritty%20Urban%20Target%20Logo.png)
+
 DEADGRID is a top-down, continuous city outbreak simulator built with Python and pygame. Choose a real place, tune the population and outbreak, then intervene while the world keeps evolving. The map uses OpenStreetMap streets and building footprints, supplemented with public Overture Maps building data when available. If map services are unavailable, a generated city keeps the simulation playable.
 
 ## Run
@@ -10,6 +12,26 @@ Python 3.10 or newer is recommended.
 python -m pip install -r requirements.txt
 python deadgrid.py
 ```
+
+## Standalone build
+
+Install dependencies and build on the same operating system you want to run:
+
+```bash
+bash build_linux.sh
+```
+
+If your default Python was built without a shared library, select one that has
+one with `PYTHON_BIN=/usr/bin/python3.12 bash build_linux.sh`.
+
+The Linux executable is written to `dist/linux/DEADGRID`. On Windows, run
+`build_windows.bat`; it creates `dist\windows\DEADGRID.exe`. PyInstaller does
+not cross-compile Windows executables from Linux, so the `.exe` build must run
+on Windows. Launching either build works offline with the generated city; live
+place lookup still requires internet access. The standalone build includes the
+core game dependencies; the optional Overture/geospatial supplement remains
+available when running from source with `requirements.txt`. Saved scenarios go
+in the user's platform-specific config directory when running a packaged build.
 
 Choose a suggested city or search for any place by name. Open **World Settings** before loading the map to change density, zombie behavior, starting resources, and automatic collapse detection. Save multiple named scenarios and select one later. Map requests need internet access. Overture data is fetched on demand and may take longer than the OSM street query. Map attribution is shown in-game. OSM data is available under the Open Database License; Overture Maps data is available under the Overture Maps Foundation's terms.
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import heapq
 import math
+import os
 import queue
 import random
 import sys
@@ -22,7 +23,26 @@ import requests
 WIDTH, HEIGHT = 1360, 820
 WORLD_W, WORLD_H = 1000.0, 700.0
 MAP_RECT = pygame.Rect(276, 118, 796, 636)
-SCENARIO_PATH = Path(__file__).with_name("deadgrid_scenarios.json")
+
+
+def _scenario_path() -> Path:
+    if not getattr(sys, "frozen", False):
+        return Path(__file__).with_name("deadgrid_scenarios.json")
+    if sys.platform == "win32":
+        config_root = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
+    elif sys.platform == "darwin":
+        config_root = Path.home() / "Library" / "Application Support"
+    else:
+        config_root = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    return config_root / "Deadgrid" / "deadgrid_scenarios.json"
+
+
+def _asset_path(name: str) -> Path:
+    return Path(getattr(sys, "_MEIPASS", Path(__file__).parent)) / name
+
+
+SCENARIO_PATH = _scenario_path()
+LOGO_PATH = _asset_path("DeadGrid_ Gritty Urban Target Logo.png")
 
 INK = (11, 17, 18)
 PANEL = (18, 27, 28)
@@ -69,6 +89,8 @@ class CityMap:
     parks: list[list[tuple[float, float]]] = field(default_factory=list)
     source: str = "SCHEMATIC"
     note: str = ""
+    water: list[list[tuple[float, float]]] = field(default_factory=list)
+    building_types: list[str] = field(default_factory=list)
 
 
 def _normalized(lon: float, lat: float, bounds: tuple[float, float, float, float]) -> tuple[float, float]:
@@ -107,6 +129,7 @@ def schematic_map(name: str, seed: int = 12) -> CityMap:
                 bh = rng.uniform(0.023, min(0.065, max(0.03, bottom - by)))
                 result.buildings.append([(bx, by), (bx + bw, by), (bx + bw, by + bh), (bx, by + bh)])
                 result.building_weights.append(rng.choice((0.3, 0.5, 1.2, 2.2, 3.8)))
+                result.building_types.append(rng.choice(("residential", "commercial", "civic", "industrial")))
     return result
 
 
@@ -134,6 +157,17 @@ def _building_population_weight(tags: dict[str, Any]) -> float:
     levels = _parse_population(tags.get("building:levels") or tags.get("num_floors") or 1)
     level_factor = min(4.0, max(0.55, levels ** 0.55)) if levels else 0.55
     return weights.get(category, 0.45) * level_factor
+
+
+def _building_category(value: Any) -> str:
+    category = str(value or "").lower()
+    if category in {"industrial", "warehouse", "factory", "manufacture", "hangar"}:
+        return "industrial"
+    if category in {"commercial", "retail", "office", "hotel", "supermarket"}:
+        return "commercial"
+    if category in {"civic", "government", "hospital", "school", "university", "church", "public"}:
+        return "civic"
+    return "residential"
 
 
 def _geometry_rings(geometry: Any) -> list[list[tuple[float, float]]]:
@@ -165,6 +199,7 @@ def _add_overture_buildings(city: CityMap, bounds: tuple[float, float, float, fl
                 if all(-0.05 <= x <= 1.05 and -0.05 <= y <= 1.05 for x, y in normalized):
                     city.buildings.append(normalized)
                     city.building_weights.append(_building_population_weight(feature.to_dict()))
+                    city.building_types.append(_building_category(feature.get("subtype", feature.get("class", "residential"))))
                     added += 1
                     if added >= 1100:
                         return added > 0
@@ -234,6 +269,8 @@ def load_city(place: str, use_overture: bool = True, radius_km: float = 1.5) -> 
         f'way["highway"]({south},{west},{north},{east});'
         f'way["building"]({south},{west},{north},{east});'
         f'way["leisure"="park"]({south},{west},{north},{east});'
+        f'way["natural"="water"]({south},{west},{north},{east});'
+        f'way["waterway"]({south},{west},{north},{east});'
         ");out geom qt;"
     )
     city = CityMap(name=display_name, center=(lat, lon), place_bounds=place_bounds, radius_km=radius_km)
@@ -261,7 +298,9 @@ def load_city(place: str, use_overture: bool = True, radius_km: float = 1.5) -> 
         if len(points) < 2:
             continue
         tags = element.get("tags", {})
-        if "highway" in tags:
+        if tags.get("natural") == "water" or "waterway" in tags:
+            city.water.append(points)
+        elif "highway" in tags:
             city.roads.append(points)
             highway = str(tags.get("highway", "residential"))
             road_class = highway
@@ -286,6 +325,7 @@ def load_city(place: str, use_overture: bool = True, radius_km: float = 1.5) -> 
         elif "building" in tags and len(points) >= 4:
             city.buildings.append(points)
             city.building_weights.append(_building_population_weight(tags))
+            city.building_types.append(_building_category(tags.get("building")))
         elif tags.get("leisure") == "park" and len(points) >= 4:
             city.parks.append(points)
 
@@ -301,9 +341,12 @@ def load_city(place: str, use_overture: bool = True, radius_km: float = 1.5) -> 
     if not city.roads:
         city.roads = fallback.roads
         city.road_types = fallback.road_types.copy()
+    if not city.water:
+        city.water = fallback.water.copy()
     if not city.buildings:
         city.buildings = fallback.buildings
         city.building_weights = fallback.building_weights.copy()
+        city.building_types = fallback.building_types.copy()
         if not city.note:
             city.note = "LIVE BUILDINGS UNAVAILABLE · GENERATED FOOTPRINTS"
     if not city.population:
@@ -413,6 +456,16 @@ class Deadgrid:
         pygame.init()
         pygame.display.set_caption("DEADGRID // City Containment")
         self.screen = pygame.display.set_mode((WIDTH, HEIGHT), pygame.RESIZABLE)
+        self.logo = pygame.image.load(str(LOGO_PATH)).convert()
+        self.logo.set_colorkey((0, 0, 0))
+        self.menu_logo = pygame.transform.smoothscale(self.logo, (612, 204))
+        self.menu_logo.set_colorkey((0, 0, 0))
+        window_icon = pygame.Surface((64, 64))
+        window_icon.fill(INK)
+        icon_wordmark = pygame.transform.smoothscale(self.logo, (60, 20))
+        icon_wordmark.set_colorkey((0, 0, 0))
+        window_icon.blit(icon_wordmark, (2, 22))
+        pygame.display.set_icon(window_icon)
         self.canvas = pygame.Surface((WIDTH, HEIGHT))
         self.clock = pygame.time.Clock()
         self.font = pygame.font.SysFont("dejavusans", 14)
@@ -437,9 +490,11 @@ class Deadgrid:
         self.infection_casualties = 0
         self.strike_casualties = 0
         self.route_failure_agents = 0
+        self.route_failure_population = 0
         self.route_failure_history: list[str] = []
         self.route_failure_locations: list[tuple[float, float, int]] = []
         self.route_failure_signature: tuple[tuple[int, int], ...] = ()
+        self.containment_timeline: list[dict[str, Any]] = []
         self.collapse_cause = ""
         self.scenario_name = "New scenario"
         self.scenario_name_active = False
@@ -452,6 +507,8 @@ class Deadgrid:
         self.hit_targets: dict[str, pygame.Rect] = {}
         self.selected_unit = "SNIPER"
         self.target_mode: str | None = None
+        self.moving_unit: dict[str, Any] | None = None
+        self.barricade_drag_start: tuple[float, float] | None = None
         self.units: list[dict[str, Any]] = []
         self.civilians: dict[str, np.ndarray] = {}
         self.zombies: dict[str, np.ndarray] = {}
@@ -484,6 +541,7 @@ class Deadgrid:
         self.budget = 1500
         self.rescued = 0
         self.casualties = 0
+        self._eliminated_population = 0
         self.infected_count = 0
         self.simulation_time = 0.0
         self.simulation_status = "Setup"
@@ -528,6 +586,7 @@ class Deadgrid:
         self.saved_scenarios = self.saved_scenarios[-12:]
         self.selected_scenario_index = len(self.saved_scenarios) - 1
         try:
+            SCENARIO_PATH.parent.mkdir(parents=True, exist_ok=True)
             SCENARIO_PATH.write_text(json.dumps(self.saved_scenarios, indent=2), encoding="utf-8")
             self._notify(f"SCENARIO SAVED · {scenario['name'].upper()}")
         except OSError:
@@ -576,6 +635,8 @@ class Deadgrid:
         self.screen_name = "deployment"
         self.selected_unit = "SNIPER"
         self.target_mode = None
+        self.moving_unit = None
+        self.barricade_drag_start = None
         self.units = []
         self.effects = []
         self.budget = self.starting_resources
@@ -583,6 +644,7 @@ class Deadgrid:
         self.simulation_status = "Deployment"
         self.end_reason = ""
         self._eliminated = 0
+        self._eliminated_population = 0
         self.evacuated_agents = 0
         self.simulation_time = self.phase_time = self.gunship = 0.0
         rng = random.Random(int(time.time()) ^ sum(ord(c) for c in city.name))
@@ -593,23 +655,28 @@ class Deadgrid:
         city.base_population = city.base_population or city.population
         city.population = population
         self.population_agents = min(50_000, population)
-        self.people_per_agent = max(1, math.ceil(population / self.population_agents))
-        self.represented_population = self.population_agents * self.people_per_agent
+        self.people_per_agent = (population + self.population_agents - 1) // self.population_agents
+        self.represented_population = population
         initial_zombie_count = max(1, round(self.population_agents * self.initial_infection_percent / 100))
         initial_zombie_count = min(self.population_agents - 1, initial_zombie_count)
+        agent_population = np.full(self.population_agents, population // self.population_agents, dtype=np.int64)
+        agent_population[:population % self.population_agents] += 1
+        agent_rng = np.random.default_rng(rng.randrange(2**32))
+        agent_rng.shuffle(agent_population)
         self.initial_infected_agents = initial_zombie_count
-        self.initial_infected_population = initial_zombie_count * self.people_per_agent
+        self.initial_infected_population = int(agent_population[:initial_zombie_count].sum())
         self.casualties = self.initial_infected_population
         self.infection_casualties = self.initial_infected_population
         self.strike_casualties = 0
         self.supply_deliveries = 0
         self.route_failure_agents = 0
+        self.route_failure_population = 0
         self.route_failure_history = []
         self.route_failure_locations = []
         self.route_failure_signature = ()
+        self.containment_timeline = []
         self.collapse_cause = ""
         civilian_count = self.population_agents - initial_zombie_count
-        agent_rng = np.random.default_rng(rng.randrange(2**32))
         if city.buildings:
             polygons = [np.asarray(polygon, dtype=np.float32) for polygon in city.buildings if len(polygon) >= 3]
             if polygons:
@@ -646,6 +713,7 @@ class Deadgrid:
             "safe": np.zeros(civilian_count, dtype=bool),
             "route_node": np.empty(civilian_count, dtype=np.int32),
             "route_narrow": np.zeros(civilian_count, dtype=bool),
+            "population": agent_population[initial_zombie_count:],
         }
         self.civilians["route_node"] = self._snap_agents_to_roads(self.civilians["x"], self.civilians["y"])
         population_cells_x = np.clip((self.civilians["x"] * (GRID_W / WORLD_W)).astype(np.int32), 0, GRID_W - 1)
@@ -661,12 +729,19 @@ class Deadgrid:
             "x": (WORLD_W * origin_x + np.cos(angles) * radii).astype(np.float32),
             "y": (WORLD_H * origin_y + np.sin(angles) * radii).astype(np.float32),
             "hp": np.full(initial_zombie_count, 40, dtype=np.float32),
+            "population": agent_population[:initial_zombie_count],
         }
         self.zombies["route_node"] = self._snap_agents_to_roads(self.zombies["x"], self.zombies["y"])
         self.zombies["route_narrow"] = np.zeros(initial_zombie_count, dtype=bool)
         self.screen_name = "deployment"
         note = city.note or f"{city.source} DATA READY"
         self._notify(f"{city.name.upper()} · {note}", 5.0)
+        self._record_containment_event(
+            "Outbreak begins",
+            f"{self.initial_infected_population:,} residents infected",
+            "outbreak",
+            [(self.patient_zero[0], self.patient_zero[1], self.initial_infected_population)],
+        )
 
     def _map_point(self, nx: float, ny: float) -> tuple[int, int]:
         return int(MAP_RECT.x + nx * MAP_RECT.w), int(MAP_RECT.y + ny * MAP_RECT.h)
@@ -848,13 +923,20 @@ class Deadgrid:
     def _record_route_failures(self, failed_mask: np.ndarray) -> None:
         failed_indices = np.flatnonzero(failed_mask)
         self.route_failure_agents = len(failed_indices)
+        self.route_failure_population = int(self.civilians["population"][failed_indices].sum())
         self.route_failure_locations = []
         if not len(failed_indices):
+            if self.route_failure_signature:
+                self._record_containment_event("Routes restored", "No residents currently stranded", "recovered")
             self.route_failure_signature = ()
             return
         cell_x = np.clip((self.civilians["x"][failed_indices] * (GRID_W / WORLD_W)).astype(np.int32), 0, GRID_W - 1)
         cell_y = np.clip((self.civilians["y"][failed_indices] * (GRID_H / WORLD_H)).astype(np.int32), 0, GRID_H - 1)
-        counts = np.bincount(cell_y * GRID_W + cell_x, minlength=GRID_W * GRID_H)
+        counts = np.bincount(
+            cell_y * GRID_W + cell_x,
+            weights=self.civilians["population"][failed_indices],
+            minlength=GRID_W * GRID_H,
+        ).round().astype(np.int64)
         hot_cells = np.argsort(counts)[::-1]
         for cell in hot_cells:
             if counts[cell] == 0 or len(self.route_failure_locations) == 3:
@@ -864,9 +946,46 @@ class Deadgrid:
             self.route_failure_locations.append(location)
         signature = tuple((round(x * 100), round(y * 100)) for x, y, _ in self.route_failure_locations)
         if signature != self.route_failure_signature:
-            self.route_failure_history.append(f"{self.route_failure_agents:,} residents have no route; inspect the highlighted blocks, one-way links, or barricades.")
+            self.route_failure_history.append(f"{self.route_failure_population:,} residents have no route; inspect the highlighted blocks, one-way links, or barricades.")
             self.route_failure_history = self.route_failure_history[-5:]
             self.route_failure_signature = signature
+            self._record_containment_event(
+                "Evacuation routes failed",
+                f"{self.route_failure_population:,} residents stranded",
+                "route_failure",
+                self.route_failure_locations.copy(),
+            )
+
+    def _record_containment_event(
+        self,
+        label: str,
+        detail: str,
+        kind: str,
+        locations: list[tuple[float, float, int]] | None = None,
+    ) -> None:
+        self.containment_timeline.append({
+            "time": self.simulation_time,
+            "label": label,
+            "detail": detail,
+            "kind": kind,
+            "locations": locations or [],
+        })
+        self.containment_timeline = self.containment_timeline[-40:]
+
+    def _population_hotspots(self) -> list[tuple[float, float, int]]:
+        if not len(self.zombies.get("x", ())):
+            return []
+        cell_x = np.clip((self.zombies["x"] * (GRID_W / WORLD_W)).astype(np.int32), 0, GRID_W - 1)
+        cell_y = np.clip((self.zombies["y"] * (GRID_H / WORLD_H)).astype(np.int32), 0, GRID_H - 1)
+        weights = self.zombies.get("population", np.ones(len(cell_x), dtype=np.int64))
+        counts = np.bincount(cell_y * GRID_W + cell_x, weights=weights, minlength=GRID_W * GRID_H).round().astype(np.int64)
+        locations = []
+        for cell in np.argsort(counts)[::-1]:
+            if counts[cell] == 0 or len(locations) == 3:
+                break
+            grid_y, grid_x = divmod(int(cell), GRID_W)
+            locations.append(((grid_x + 0.5) / GRID_W, (grid_y + 0.5) / GRID_H, int(counts[cell])))
+        return locations
 
     def _move_evacuating(self, dt: float) -> None:
         crowd = self.civilians
@@ -927,7 +1046,7 @@ class Deadgrid:
                 removed[indices] = True
                 station["evac_progress"] -= len(indices)
                 self.evacuated_agents += len(indices)
-                self.rescued += len(indices) * self.people_per_agent
+                self.rescued += int(crowd["population"][indices].sum())
         if np.any(removed):
             self.civilians = {key: values[~removed] for key, values in crowd.items()}
 
@@ -986,24 +1105,79 @@ class Deadgrid:
 
     def _draw_city(self, surface: pygame.Surface, rect: pygame.Rect, city: CityMap) -> None:
         pygame.draw.rect(surface, MAP_BASE, rect)
+        previous_clip = surface.get_clip()
         surface.set_clip(rect)
+
         def screen_points(points: list[tuple[float, float]]) -> list[tuple[int, int]]:
             return [(int(rect.x + x * rect.w), int(rect.y + y * rect.h)) for x, y in points]
+
+        # Terrain, parks, and water sit beneath every built feature.
         for park in city.parks:
             points = screen_points(park)
             if len(points) >= 3:
                 pygame.draw.polygon(surface, (162, 190, 147), points)
-        for road in city.roads:
-            points = screen_points(road)
-            if len(points) >= 2:
-                pygame.draw.lines(surface, (172, 184, 163), False, points, 7)
-                pygame.draw.lines(surface, MAP_ROAD, False, points, 4)
-        for polygon in city.buildings:
+        for water in city.water:
+            points = screen_points(water)
+            if len(points) >= 3 and math.dist(points[0], points[-1]) <= 2:
+                pygame.draw.polygon(surface, (91, 153, 166), points)
+                pygame.draw.polygon(surface, (115, 177, 187), points, 1)
+            elif len(points) >= 2:
+                pygame.draw.lines(surface, (91, 153, 166), False, points, max(5, rect.w // 120))
+
+        # Use classes give footprints quiet but distinct map color.
+        building_colors = {
+            "residential": (143, 158, 145),
+            "commercial": (166, 159, 130),
+            "industrial": (128, 148, 151),
+            "civic": (176, 151, 132),
+        }
+        for index, polygon in enumerate(city.buildings):
             points = screen_points(polygon)
             if len(points) >= 3:
-                pygame.draw.polygon(surface, MAP_BUILDING, points)
-                pygame.draw.polygon(surface, (121, 139, 126), points, 1)
-        surface.set_clip(None)
+                category = city.building_types[index] if index < len(city.building_types) else "residential"
+                color = building_colors.get(category, MAP_BUILDING)
+                pygame.draw.polygon(surface, color, points)
+                pygame.draw.polygon(surface, (104, 122, 113), points, 1)
+
+        # Streets are painted after footprints so intersections remain legible.
+        minor_types = {"residential", "living_street", "service", "unclassified", "footway", "path", "track", "pedestrian", "cycleway"}
+        major_types = {"motorway", "motorway_link", "trunk", "trunk_link", "primary", "primary_link", "secondary", "secondary_link", "tertiary", "tertiary_link"}
+        roads_by_layer: dict[str, list[tuple[list[tuple[int, int]], str]]] = {"minor": [], "major": [], "bridge": []}
+        for index, road in enumerate(city.roads):
+            points = screen_points(road)
+            if len(points) < 2:
+                continue
+            road_type = city.road_types[index] if index < len(city.road_types) else "residential"
+            attributes = set(road_type.split("|"))
+            road_class = next(iter(attributes - {"bridge", "narrow", "oneway", "oneway_reverse"}), "residential")
+            layer = "bridge" if "bridge" in attributes else ("major" if road_class in major_types else "minor")
+            roads_by_layer[layer].append((points, road_class))
+
+        def draw_markings(points: list[tuple[int, int]], color: tuple[int, int, int], dash_length: float) -> None:
+            for start, end in zip(points, points[1:]):
+                dx, dy = end[0] - start[0], end[1] - start[1]
+                length = math.hypot(dx, dy)
+                offset = 0.0
+                while offset < length:
+                    finish = min(length, offset + dash_length * 0.58)
+                    first = (round(start[0] + dx * offset / length), round(start[1] + dy * offset / length))
+                    second = (round(start[0] + dx * finish / length), round(start[1] + dy * finish / length))
+                    pygame.draw.line(surface, color, first, second, 1)
+                    offset += dash_length
+
+        for points, _ in roads_by_layer["minor"]:
+            pygame.draw.lines(surface, (135, 149, 136), False, points, 5)
+            pygame.draw.lines(surface, (224, 225, 204), False, points, 3)
+        for points, _ in roads_by_layer["major"]:
+            pygame.draw.lines(surface, (107, 122, 119), False, points, 10)
+            pygame.draw.lines(surface, (211, 210, 185), False, points, 7)
+            draw_markings(points, (169, 151, 108), 13)
+        for points, _ in roads_by_layer["bridge"]:
+            pygame.draw.lines(surface, (75, 113, 124), False, points, 12)
+            pygame.draw.lines(surface, (177, 195, 188), False, points, 8)
+            draw_markings(points, (219, 195, 132), 12)
+
+        surface.set_clip(previous_clip)
         pygame.draw.rect(surface, LINE, rect, 1)
 
     def _text(self, surface: pygame.Surface, text: str, x: int, y: int, color: tuple[int, int, int] = TEXT, font: pygame.font.Font | None = None) -> None:
@@ -1022,6 +1196,61 @@ class Deadgrid:
         self._text(surface, label, rect.x + (7 if compact else 10), rect.y + (4 if compact else (8 if subtitle else 11)), tint, self.small if compact else self.bold)
         if subtitle:
             self._text(surface, subtitle, rect.x + 10, rect.y + 28, MUTED if not disabled else (68, 79, 75), self.small)
+
+    def _draw_tooltip(self, surface: pygame.Surface) -> None:
+        if not self.mouse:
+            return
+        hovered = next((key for key, rect in self.hit_targets.items() if rect.collidepoint(self.mouse)), None)
+        if hovered is None:
+            return
+        tooltips = {
+            **{
+                f"unit_{kind}": (
+                    kind,
+                    f"${item['cost']} · {item['description'].lower()}. "
+                    + ("Drag to lay a wall; ends snap to nearby buildings." if kind == "BARRICADE" else "Click map to place the preview.")
+                )
+                for kind, item in UNITS.items()
+            },
+            "strike": ("BOMBER STRIKE", "$180 · Preview the blast radius, then click to confirm."),
+            "gunship": ("GUNSHIP", "$290 · Preview its coverage, then click to confirm."),
+            "origin": ("PATIENT ZERO", "Choose a new outbreak origin during deployment."),
+            "policy_EVACUATE": ("EVACUATE", "Route residents toward deployed evacuation stations."),
+            "policy_SHELTER": ("SHELTER", "Route residents to safe zones within capacity."),
+            "policy_FLEE": ("FLEE", "Residents flee local horde pressure without a destination."),
+            "intel_risk": ("INFECTION RISK", "Show local infection pressure on the map."),
+            "intel_horde": ("HORDE DENSITY", "Show zombie concentration by map cell."),
+            "intel_exposed": ("EXPOSED", "Show residents incubating before conversion."),
+            "intel_survivors": ("SURVIVORS", "Show remaining uninfected residents by map cell."),
+        }
+        tooltip = tooltips.get(hovered)
+        if tooltip is None:
+            return
+        title, detail = tooltip
+        max_text_width = 268
+        words = detail.split()
+        lines: list[str] = []
+        current = ""
+        for word in words:
+            candidate = f"{current} {word}".strip()
+            if current and self.small.size(candidate)[0] > max_text_width:
+                lines.append(current)
+                current = word
+            else:
+                current = candidate
+        if current:
+            lines.append(current)
+        width = min(294, max(self.bold.size(title)[0], *(self.small.size(line)[0] for line in lines)) + 20)
+        height = 26 + len(lines) * 14
+        button = self.hit_targets[hovered]
+        x = button.x - width - 10 if button.x > width + 20 else button.right + 10
+        y = max(84, min(HEIGHT - height - 8, button.centery - height // 2))
+        box = pygame.Rect(x, y, width, height)
+        pygame.draw.rect(surface, PANEL_HI, box, border_radius=4)
+        pygame.draw.rect(surface, CYAN, box, 1, border_radius=4)
+        self._text(surface, title, x + 10, y + 6, TEXT, self.bold)
+        for index, line in enumerate(lines):
+            self._text(surface, line, x + 10, y + 24 + index * 14, MUTED, self.small)
 
     def _header(self, surface: pygame.Surface, mode: str) -> None:
         pygame.draw.rect(surface, PANEL, (0, 0, WIDTH, 78))
@@ -1047,12 +1276,7 @@ class Deadgrid:
         pygame.draw.circle(surface, (222, 83, 73), (ox, oy), 76, 1)
         pygame.draw.circle(surface, (222, 83, 73), (ox, oy), 38, 1)
         pygame.draw.circle(surface, RED, (ox, oy), 5)
-        self._text(surface, "OUTBREAK SIMULATION  /  CONTAINMENT PLANNER", 34, 115, CYAN, self.small)
-        self._text(surface, "HOLD THE LINE.", 34, 153, TEXT, self.large)
-        self._text(surface, "SAVE WHO YOU CAN.", 34, 196, LIME, self.large)
-        self._text(surface, "The city is the map. The crowd is the clock.", 36, 252, MUTED)
-        self._text(surface, "Choose a real place, read the streets, and set your", 36, 279, MUTED)
-        self._text(surface, "perimeter before the first infected move.", 36, 299, MUTED)
+        surface.blit(self.menu_logo, (36, 112))
         pygame.draw.line(surface, LINE, (36, 339), (654, 339), 1)
         self._text(surface, "AREA OF OPERATIONS", 36, 361, CYAN, self.small)
         input_rect = pygame.Rect(36, 389, 615, 47)
@@ -1137,12 +1361,20 @@ class Deadgrid:
 
     def _draw_map_overlay(self, surface: pygame.Surface) -> None:
         self._draw_city(surface, MAP_RECT, self.city)
-        self._draw_intelligence(surface)
-        infection = self._map_point(*self.infection_origin)
-        pygame.draw.circle(surface, (214, 77, 70), infection, 47, 1)
-        pygame.draw.circle(surface, (214, 77, 70), infection, 24, 1)
-        pygame.draw.circle(surface, RED, infection, 4)
-        self._text(surface, "PATIENT ZERO", infection[0] + 10, infection[1] - 20, RED, self.small)
+        intel_labels = self._draw_intelligence(surface)
+
+        # Moving cohorts stay above the intelligence heatmaps.
+        self._draw_agents(surface, self.civilians["x"], self.civilians["y"], self.civilians["status"] == 0, (250, 250, 242))
+        self._draw_agents(surface, self.civilians["x"], self.civilians["y"], self.civilians["status"] == 1, LIME)
+        self._draw_agents(surface, self.zombies["x"], self.zombies["y"], np.ones(len(self.zombies["x"]), dtype=bool), LIME)
+
+        for effect in self.effects:
+            progress = effect["age"] / effect["duration"]
+            radius = int(effect["radius"] * (0.45 + progress * 0.7) * MAP_RECT.w / WORLD_W)
+            color = AMBER if effect["kind"] == "strike" else CYAN
+            pygame.draw.circle(surface, color, self._map_point(effect["x"] / WORLD_W, effect["y"] / WORLD_H), radius, 2)
+
+        # Deployed assets are intentionally visible over crowds and streets.
         for structure in self.units:
             center = self._map_point(structure["x"] / WORLD_W, structure["y"] / WORLD_H)
             kind = structure["kind"]
@@ -1154,8 +1386,6 @@ class Deadgrid:
                 pygame.draw.circle(surface, data["color"], center, 9, 2)
                 pygame.draw.line(surface, data["color"], (center[0] - 4, center[1]), (center[0] + 4, center[1]), 2)
                 pygame.draw.line(surface, data["color"], (center[0], center[1] - 4), (center[0], center[1] + 4), 2)
-                radius = max(18, int(UNITS[kind]["range"] * MAP_RECT.w / WORLD_W))
-                pygame.draw.circle(surface, data["color"], center, radius, 1)
             elif kind == "SUPPLY DROP":
                 pygame.draw.rect(surface, data["color"], pygame.Rect(center[0] - 7, center[1] - 7, 14, 14), border_radius=2)
                 pygame.draw.line(surface, INK, (center[0] - 4, center[1]), (center[0] + 4, center[1]), 2)
@@ -1163,33 +1393,81 @@ class Deadgrid:
                 pygame.draw.circle(surface, (14, 25, 25), center, 11)
                 pygame.draw.circle(surface, data["color"], center, 8, 2)
                 pygame.draw.circle(surface, data["color"], center, 3)
-                if self.screen_name == "deployment" and kind in ("SNIPER", "MORTAR"):
-                    pygame.draw.circle(surface, (*data["color"], 35), center, max(8, int(data["range"] * MAP_RECT.w / WORLD_W)), 1)
-        self._draw_agents(surface, self.civilians["x"], self.civilians["y"], self.civilians["status"] == 0, (250, 250, 242))
-        self._draw_agents(surface, self.civilians["x"], self.civilians["y"], self.civilians["status"] == 1, LIME)
-        self._draw_agents(surface, self.zombies["x"], self.zombies["y"], np.ones(len(self.zombies["x"]), dtype=bool), LIME)
-        for effect in self.effects:
-            progress = effect["age"] / effect["duration"]
-            radius = int(effect["radius"] * (0.45 + progress * 0.7) * MAP_RECT.w / WORLD_W)
-            color = AMBER if effect["kind"] == "strike" else CYAN
-            pygame.draw.circle(surface, color, self._map_point(effect["x"] / WORLD_W, effect["y"] / WORLD_H), radius, 2)
+
+        # Route highlights, selection, and labels form the top map layer.
+        if self.screen_name == "active" and len(self.evac_next_nodes) == len(self.road_nodes):
+            evacuating = np.flatnonzero(self.civilians["evacuating"] & (self.civilians["status"] == 0))
+            if len(evacuating):
+                node = int(self.civilians["route_node"][evacuating[0]])
+                route = []
+                visited = set()
+                while 0 <= node < len(self.road_nodes) and node not in visited and len(route) < len(self.road_nodes):
+                    visited.add(node)
+                    road_x, road_y = self.road_nodes[node]
+                    route.append(self._map_point(float(road_x / WORLD_W), float(road_y / WORLD_H)))
+                    node = int(self.evac_next_nodes[node])
+                    if node < 0:
+                        break
+                if len(route) > 1:
+                    pygame.draw.lines(surface, CYAN, False, route, 2)
+
+        infection = self._map_point(*self.infection_origin)
+        pygame.draw.circle(surface, (214, 77, 70), infection, 47, 1)
+        pygame.draw.circle(surface, (214, 77, 70), infection, 24, 1)
+        pygame.draw.circle(surface, RED, infection, 4)
+        if self.moving_unit in self.units:
+            center = self._map_point(self.moving_unit["x"] / WORLD_W, self.moving_unit["y"] / WORLD_H)
+            radius = max(12, int(self.moving_unit["range"] * MAP_RECT.w / WORLD_W))
+            pygame.draw.circle(surface, UNITS[self.moving_unit["kind"]]["color"], center, radius, 1)
+            pygame.draw.circle(surface, TEXT, center, 14, 1)
+        self._text(surface, "PATIENT ZERO", infection[0] + 10, infection[1] - 20, RED, self.small)
+        if intel_labels:
+            title = "INTEL  /  " + "  ·  ".join(intel_labels)
+            self._text(surface, title[:86], MAP_RECT.right - 390, MAP_RECT.y + 13, TEXT, self.small)
         if self.target_mode:
             cursor = self._map_point(*self._target_preview())
-            color = RED if self.target_mode == "origin" else (AMBER if self.target_mode == "strike" else CYAN)
-            pygame.draw.circle(surface, color, cursor, 14, 1)
-            pygame.draw.line(surface, color, (cursor[0] - 20, cursor[1]), (cursor[0] + 20, cursor[1]), 1)
-            pygame.draw.line(surface, color, (cursor[0], cursor[1] - 20), (cursor[0], cursor[1] + 20), 1)
+            color = RED if self.target_mode == "origin" else (AMBER if self.target_mode in ("strike", "deploy") else CYAN)
+            if self.target_mode == "deploy" and self.selected_unit == "BARRICADE":
+                if self.barricade_drag_start:
+                    end = self._snap_barricade_anchor(self._world_point(cursor))
+                    start = self.barricade_drag_start
+                    start_point = self._map_point(start[0] / WORLD_W, start[1] / WORLD_H)
+                    end_point = self._map_point(end[0] / WORLD_W, end[1] / WORLD_H)
+                    pygame.draw.line(surface, (34, 42, 39), start_point, end_point, 9)
+                    pygame.draw.line(surface, AMBER, start_point, end_point, 4)
+                    length = math.dist(start, end)
+                    count = max(1, math.ceil(length / 48.0) + (1 if length >= 18.0 else 0))
+                    for index in range(count):
+                        fraction = index / max(1, count - 1)
+                        post = (round(start_point[0] + (end_point[0] - start_point[0]) * fraction), round(start_point[1] + (end_point[1] - start_point[1]) * fraction))
+                        pygame.draw.circle(surface, AMBER, post, 5, 2)
+                    self._text(surface, f"{count} POSTS  ·  ${count * UNITS['BARRICADE']['cost']}", min(start_point[0], end_point[0]) + 8, min(start_point[1], end_point[1]) - 18, AMBER, self.small)
+                else:
+                    pygame.draw.circle(surface, AMBER, cursor, 7, 2)
+                    pygame.draw.line(surface, AMBER, (cursor[0] - 8, cursor[1]), (cursor[0] + 8, cursor[1]), 2)
+            else:
+                if self.target_mode == "deploy":
+                    radius_world = UNITS[self.selected_unit]["range"]
+                elif self.target_mode == "strike":
+                    radius_world = 60
+                elif self.target_mode == "gunship":
+                    radius_world = 92
+                else:
+                    radius_world = 30
+                radius = max(7, int(radius_world * MAP_RECT.w / WORLD_W))
+                pygame.draw.circle(surface, color, cursor, radius, 1)
+                pygame.draw.circle(surface, color, cursor, 5, 2)
+                pygame.draw.line(surface, color, (cursor[0] - 12, cursor[1]), (cursor[0] + 12, cursor[1]), 1)
+                pygame.draw.line(surface, color, (cursor[0], cursor[1] - 12), (cursor[0], cursor[1] + 12), 1)
 
-    def _draw_intelligence(self, surface: pygame.Surface) -> None:
+    def _draw_intelligence(self, surface: pygame.Surface) -> list[str]:
         labels = {"risk": "INFECTION RISK", "horde": "HORDE DENSITY", "exposed": "EXPOSED CIVILIANS", "survivors": "EST. SURVIVORS"}
         shown = []
         for mode, enabled in self.intel_modes.items():
             if enabled and mode in self.intel_layers:
                 surface.blit(self.intel_layers[mode], MAP_RECT.topleft)
                 shown.append(labels[mode])
-        if shown:
-            title = "INTEL  /  " + "  ·  ".join(shown)
-            self._text(surface, title[:86], MAP_RECT.right - 390, MAP_RECT.y + 13, TEXT, self.small)
+        return shown
 
     def _target_preview(self) -> tuple[float, float]:
         x, y = self.mouse
@@ -1208,7 +1486,7 @@ class Deadgrid:
         pygame.draw.line(surface, LINE, (36, 193), (240, 193), 1)
         self._text(surface, "ESTIMATED RESIDENTS", 36, 209, MUTED, self.small)
         self._text(surface, f"~{self.city.population:,}", 36, 231, TEXT, self.large)
-        self._text(surface, f"{self.people_per_agent:,} PEOPLE PER AGENT", 36, 269, MUTED, self.small)
+        self._text(surface, f"MAX {self.people_per_agent:,} PEOPLE / AGENT", 36, 269, MUTED, self.small)
         pygame.draw.line(surface, LINE, (36, 290), (240, 290), 1)
         self._text(surface, "INITIAL INFECTED", 36, 302, RED, self.small)
         self._text(surface, f"{self.initial_infected_agents:,} AGENTS (~{self.initial_infected_population:,} PEOPLE)", 36, 322, TEXT, self.small)
@@ -1238,12 +1516,15 @@ class Deadgrid:
         self._draw_map_overlay(surface)
         pygame.draw.rect(surface, PANEL, (MAP_RECT.x, MAP_RECT.bottom, MAP_RECT.w, 27))
         self._text(surface, f"{self.city.name.upper()}   ·   {self.city.source}   ·   © OPENSTREETMAP CONTRIBUTORS / OVERTURE MAPS", MAP_RECT.x + 12, MAP_RECT.bottom + 7, (118, 140, 128), self.small)
-        if self.target_mode == "origin":
+        if self.target_mode == "deploy":
+            instruction = "DRAG TO LAY WALL · RELEASE TO PLACE" if self.selected_unit == "BARRICADE" and self.barricade_drag_start else ("BARRICADE · CLICK OR DRAG TO PLACE" if self.selected_unit == "BARRICADE" else "PLACEMENT PREVIEW · CLICK TO CONFIRM")
+            self._text(surface, instruction, MAP_RECT.x + 15, MAP_RECT.y + 13, AMBER, self.small)
+        elif self.target_mode == "origin":
             self._text(surface, "SET OUTBREAK ORIGIN  ·  CLICK MAP", MAP_RECT.x + 15, MAP_RECT.y + 13, RED, self.small)
         elif self.target_mode == "move":
             self._text(surface, "SELECT NEW POSITION  ·  CLICK MAP TO CONFIRM", MAP_RECT.x + 15, MAP_RECT.y + 13, CYAN, self.small)
         elif self.target_mode:
-            mode_name = "BOMBER STRIKE" if self.target_mode == "strike" else "GUNSHIP TASKING"
+            mode_name = "BOMBER STRIKE" if self.target_mode == "strike" else ("GUNSHIP TASKING" if self.target_mode == "gunship" else "REPOSITION ASSET")
             self._text(surface, f"AIMING  /  {mode_name}  ·  CLICK MAP TO CONFIRM", MAP_RECT.x + 15, MAP_RECT.y + 13, AMBER if self.target_mode == "strike" else CYAN, self.small)
         else:
             label = "SET PERIMETER  /  CLICK TO DEPLOY" if not active else ("PAUSED  ·  SPACE TO RESUME" if self.phase_time == -1 else "LIVE FIELD VIEW  /  RIGHT-CLICK TO CANCEL")
@@ -1256,8 +1537,10 @@ class Deadgrid:
         for index, kind in enumerate(unit_order):
             y = 168 + index * 43
             item = UNITS[kind]
-            active_tool = self.selected_unit == kind and not self.target_mode
+            active_tool = self.selected_unit == kind and self.target_mode in (None, "deploy")
             self._button(surface, f"unit_{kind}", pygame.Rect(1108, y, 216, 40), kind, active=active_tool, accent=item["color"], subtitle=f"${item['cost']}  /  {item['description']}")
+            if active_tool:
+                pygame.draw.rect(surface, item["color"], pygame.Rect(1104, y - 2, 4, 44), border_radius=2)
             if index < 6:
                 self._text(surface, str(index + 1), 1310, y + 13, MUTED, self.small)
         pygame.draw.line(surface, LINE, (1108, 516), (1324, 516), 1)
@@ -1283,39 +1566,77 @@ class Deadgrid:
             color = UNITS[self.selected_unit]["color"]
             pygame.draw.circle(surface, color, cursor, 10, 1)
             pygame.draw.line(surface, color, (cursor[0] - 15, cursor[1]), (cursor[0] + 15, cursor[1]), 1)
+        self._draw_tooltip(surface)
 
     def _draw_analysis(self) -> None:
         self.canvas.fill(INK)
         self._header(self.canvas, "SIMULATION ANALYSIS")
-        self._text(self.canvas, f"{self.end_reason or 'SIMULATION STOPPED'}  /  {self.simulation_status.upper()}", 72, 128, AMBER if self.simulation_status == "Collapsed" else CYAN, self.bold)
-        self._text(self.canvas, self.city.name.upper(), 75, 212, CYAN, self.bold)
-        self._text(self.canvas, f"PATIENT ZERO  /  X {self.patient_zero[0]:.0%}  ·  Y {self.patient_zero[1]:.0%}  ·  AREA RADIUS {self.radius_km:.2f} KM", 75, 238, MUTED, self.small)
-        pygame.draw.line(self.canvas, LINE, (74, 272), (1285, 272), 1)
-        stats = [
-            ("ESTIMATED RESIDENTS", f"~{self.city.population:,}", TEXT),
-            ("RESCUED POPULATION", f"{self.rescued:,}", LIME),
-            ("CIVILIAN CASUALTIES", f"{self.casualties:,}", RED),
-            ("INITIAL INFECTED", f"{self.initial_infected_agents:,} agents", AMBER),
-            ("PEOPLE PER AGENT", f"{self.people_per_agent:,}", CYAN),
-            ("RESIDENTS REMAINING", f"{max(0, self.represented_population - self.rescued - self.casualties):,}", LIME),
-        ]
-        for index, (label, value, color) in enumerate(stats):
-            x = 75 + (index % 3) * 405
-            y = 300 + (index // 3) * 112
-            self._text(self.canvas, label, x, y, MUTED, self.small)
-            self._text(self.canvas, value, x, y + 25, color, self.large)
-        self._text(self.canvas, f"RUN TIME  {int(self.simulation_time // 60):02}:{int(self.simulation_time % 60):02}  ·  ZOMBIES ELIMINATED  {self._eliminated:,}", 75, 548, TEXT, self.bold)
-        cause = self.collapse_cause or f"INFECTION LOSSES {self.infection_casualties:,}  ·  STRIKE LOSSES {self.strike_casualties:,}  ·  SUPPLY DROPS {self.supply_deliveries}"
-        self._text(self.canvas, f"OUTCOME  /  {cause[:112]}", 75, 579, AMBER, self.small)
-        self._text(self.canvas, f"ROUTE FAILURES  /  {self.route_failure_agents:,} UNROUTED RESIDENTS", 75, 607, RED if self.route_failure_agents else MUTED, self.small)
-        if self.route_failure_history:
-            self._text(self.canvas, self.route_failure_history[-1][:112], 75, 627, MUTED, self.small)
-        if self.route_failure_locations:
-            hotspots = "  ·  ".join(f"{x:.0%}/{y:.0%} ({count:,})" for x, y, count in self.route_failure_locations)
-            self._text(self.canvas, f"STRANDED MAP CELLS  /  {hotspots}"[:118], 75, 648, AMBER, self.small)
-        self._text(self.canvas, f"FIELD RESOURCES REMAINING  ${self.budget:,}", 75, 670, LIME, self.small)
-        self._button(self.canvas, "restart_scenario", pygame.Rect(75, 700, 345, 70), "RESTART SAME SCENARIO  ↻", accent=LIME, subtitle="KEEP CITY, SETTINGS, AND PATIENT ZERO")
-        self._button(self.canvas, "change_parameters", pygame.Rect(440, 700, 300, 70), "CHANGE PARAMETERS", accent=CYAN, subtitle="RETURN TO WORLD SETUP")
+        self._text(self.canvas, f"{self.end_reason or 'SIMULATION STOPPED'}  /  {self.simulation_status.upper()}", 50, 98, AMBER if self.simulation_status == "Collapsed" else CYAN, self.bold)
+        self._text(self.canvas, self.city.name.upper(), 50, 121, TEXT, self.bold)
+        self._text(self.canvas, f"RUN TIME  {int(self.simulation_time // 60):02}:{int(self.simulation_time % 60):02}  ·  PATIENT ZERO  {self.patient_zero[0]:.0%}/{self.patient_zero[1]:.0%}  ·  RADIUS {self.radius_km:.2f} KM", 465, 121, MUTED, self.small)
+
+        ledger = self._population_ledger()
+        ledger_rect = pygame.Rect(45, 153, 380, 390)
+        pygame.draw.rect(self.canvas, PANEL, ledger_rect, border_radius=4)
+        pygame.draw.rect(self.canvas, LINE, ledger_rect, 1, border_radius=4)
+        self._text(self.canvas, "POPULATION LEDGER", 64, 169, CYAN, self.bold)
+        rows = (
+            ("STARTING RESIDENTS", ledger["starting"], TEXT),
+            ("CURRENTLY UNINFECTED", ledger["uninfected"], LIME),
+            ("EXPOSED", ledger["exposed"], AMBER),
+            ("INFECTED", ledger["infected"], RED),
+            ("RESCUED", ledger["rescued"], CYAN),
+            ("DEAD", ledger["dead"], (220, 115, 105)),
+        )
+        for index, (label, value, color) in enumerate(rows):
+            y = 205 + index * 46
+            self._text(self.canvas, label, 64, y, MUTED, self.small)
+            value_text = f"{value:,}"
+            value_width = self.bold.size(value_text)[0]
+            self._text(self.canvas, value_text, ledger_rect.right - 18 - value_width, y - 2, color, self.bold)
+            if index < len(rows) - 1:
+                pygame.draw.line(self.canvas, LINE, (64, y + 30), (ledger_rect.right - 18, y + 30), 1)
+        reconciles = ledger["accounted"] == ledger["starting"]
+        balance_text = "RECONCILED · 0 UNASSIGNED" if reconciles else f"UNRECONCILED · {ledger['starting'] - ledger['accounted']:,}"
+        self._text(self.canvas, balance_text, 64, 493, LIME if reconciles else RED, self.small)
+        self._text(self.canvas, f"ZOMBIES ELIMINATED  {self._eliminated:,}  ·  FIELD FUNDS  ${self.budget:,}", 64, 518, MUTED, self.small)
+
+        self._text(self.canvas, "CONTAINMENT FAILURE MAP", 465, 145, CYAN, self.small)
+        map_rect = pygame.Rect(465, 163, 850, 380)
+        self._draw_city(self.canvas, map_rect, self.city)
+        marker_colors = {"outbreak": RED, "route_failure": AMBER, "critical": (234, 130, 76), "collapsed": (235, 75, 68)}
+        for event in self.containment_timeline:
+            color = marker_colors.get(event["kind"])
+            if color is None:
+                continue
+            for x, y, population in event["locations"]:
+                point = (int(map_rect.x + x * map_rect.w), int(map_rect.y + y * map_rect.h))
+                radius = 5 if event["kind"] == "outbreak" else min(20, 7 + int(math.log10(max(1, population)) * 2))
+                pygame.draw.circle(self.canvas, color, point, radius, 2)
+                pygame.draw.circle(self.canvas, color, point, 3)
+        legend_items = ((RED, "OUTBREAK"), (AMBER, "ROUTE FAILURE"), ((234, 130, 76), "CRITICAL SPREAD"), ((235, 75, 68), "COLLAPSE"))
+        legend_x = 465
+        for color, label in legend_items:
+            pygame.draw.circle(self.canvas, color, (legend_x + 5, 559), 4)
+            self._text(self.canvas, label, legend_x + 15, 553, MUTED, self.small)
+            legend_x += 151
+
+        self._text(self.canvas, "CONTAINMENT TIMELINE", 50, 580, CYAN, self.small)
+        events = self.containment_timeline[-5:]
+        if events:
+            pygame.draw.line(self.canvas, LINE, (78, 605), (78, 693), 1)
+            for index, event in enumerate(events):
+                y = 600 + index * 19
+                color = marker_colors.get(event["kind"], MUTED)
+                pygame.draw.circle(self.canvas, color, (78, y + 5), 3)
+                elapsed = int(event["time"])
+                self._text(self.canvas, f"T+{elapsed // 60:02}:{elapsed % 60:02}", 94, y, MUTED, self.small)
+                self._text(self.canvas, event["label"].upper(), 170, y, TEXT, self.small)
+                self._text(self.canvas, event["detail"][:105], 390, y, MUTED, self.small)
+        else:
+            self._text(self.canvas, "No containment events recorded.", 94, 606, MUTED, self.small)
+        self._button(self.canvas, "restart_scenario", pygame.Rect(915, 710, 210, 62), "RESTART SCENARIO", accent=LIME, subtitle="SAME CITY AND SETTINGS")
+        self._button(self.canvas, "change_parameters", pygame.Rect(1140, 710, 175, 62), "NEW OPERATION", accent=CYAN, subtitle="CHANGE PARAMETERS")
 
     def _screen_position(self, event: pygame.event.Event) -> tuple[int, int]:
         width, height = self.screen.get_size()
@@ -1329,6 +1650,56 @@ class Deadgrid:
             return False
         self.budget -= amount
         return True
+
+    def _snap_barricade_anchor(self, point: tuple[float, float]) -> tuple[float, float]:
+        x, y = point
+        nearest = point
+        nearest_distance = 48.0 ** 2
+        for polygon in self.city.buildings:
+            vertices = [(px * WORLD_W, py * WORLD_H) for px, py in polygon]
+            for start, end in zip(vertices, vertices[1:] + vertices[:1]):
+                dx, dy = end[0] - start[0], end[1] - start[1]
+                length_squared = dx * dx + dy * dy
+                fraction = 0.0 if not length_squared else max(0.0, min(1.0, ((x - start[0]) * dx + (y - start[1]) * dy) / length_squared))
+                candidate = (start[0] + fraction * dx, start[1] + fraction * dy)
+                distance = (candidate[0] - x) ** 2 + (candidate[1] - y) ** 2
+                if distance < nearest_distance:
+                    nearest, nearest_distance = candidate, distance
+        for unit in self.units:
+            if unit["kind"] != "BARRICADE":
+                continue
+            distance = (unit["x"] - x) ** 2 + (unit["y"] - y) ** 2
+            if distance < nearest_distance:
+                nearest, nearest_distance = (unit["x"], unit["y"]), distance
+        return nearest
+
+    def _deploy_barricade_line(self, start: tuple[float, float], end: tuple[float, float]) -> int:
+        start = self._snap_barricade_anchor(start)
+        end = self._snap_barricade_anchor(end)
+        length = math.dist(start, end)
+        count = max(1, math.ceil(length / 48.0) + (1 if length >= 18.0 else 0))
+        positions = [
+            (start[0] + (end[0] - start[0]) * index / max(1, count - 1),
+             start[1] + (end[1] - start[1]) * index / max(1, count - 1))
+            for index in range(count)
+        ]
+        cost = UNITS["BARRICADE"]["cost"] * count
+        if not self._pay(cost):
+            return 0
+        for x, y in positions:
+            self.units.append({"kind": "BARRICADE", "x": x, "y": y, "range": 0, "timer": 0.0})
+        self.route_refresh = 0.0
+        self.evac_route_refresh = 0.0
+        self._notify(f"BARRICADE LINE DEPLOYED · {count} POSTS · ${cost} COMMITTED")
+        return count
+
+    def _finish_barricade_drag(self, point: tuple[int, int]) -> None:
+        start = self.barricade_drag_start
+        self.barricade_drag_start = None
+        if start is None or not MAP_RECT.collidepoint(point):
+            return
+        self._deploy_barricade_line(start, self._world_point(point))
+        self.target_mode = None
 
     def _deploy(self, point: tuple[int, int]) -> None:
         if not MAP_RECT.collidepoint(point):
@@ -1374,11 +1745,12 @@ class Deadgrid:
             killed = self._damage_zombies(x, y, radius, 115)
             civilian_range = 28.0
             lost = ((self.civilians["x"] - x) ** 2 + (self.civilians["y"] - y) ** 2 < civilian_range ** 2)
-            self.casualties += int(np.count_nonzero(lost)) * self.people_per_agent
-            self.strike_casualties += int(np.count_nonzero(lost)) * self.people_per_agent
+            lost_population = int(self.civilians["population"][lost].sum())
+            self.casualties += lost_population
+            self.strike_casualties += lost_population
             self.civilians = {key: values[~lost] for key, values in self.civilians.items()}
             self.effects.append({"x": x, "y": y, "radius": radius, "duration": 1.1, "age": 0, "kind": "strike"})
-            self._notify(f"BOMBER STRIKE · {killed:,} HOSTILES · {int(np.count_nonzero(lost)) * self.people_per_agent:,} CIVILIAN CASUALTIES", 4.0)
+            self._notify(f"BOMBER STRIKE · {killed:,} HOSTILES · {lost_population:,} CIVILIAN CASUALTIES", 4.0)
         elif self.target_mode == "gunship":
             cost = 290
             if not self._pay(cost):
@@ -1394,38 +1766,73 @@ class Deadgrid:
         self.zombies["hp"][within] -= damage
         alive = self.zombies["hp"] > 0
         killed = int(len(alive) - np.count_nonzero(alive))
+        zombie_population = self.zombies.get("population", np.ones(len(alive), dtype=np.int64))
+        self._eliminated_population += int(zombie_population[~alive].sum())
         self.zombies = {key: values[alive] for key, values in self.zombies.items()}
         self._eliminated = getattr(self, "_eliminated", 0) + killed
         return killed
+
+    def _population_ledger(self) -> dict[str, int]:
+        civilian_weights = self.civilians.get("population", np.ones(len(self.civilians.get("x", ())), dtype=np.int64))
+        civilian_status = self.civilians.get("status", np.zeros(len(civilian_weights), dtype=np.uint8))
+        zombie_weights = self.zombies.get("population", np.ones(len(self.zombies.get("x", ())), dtype=np.int64))
+        ledger = {
+            "starting": self.represented_population,
+            "uninfected": int(civilian_weights[civilian_status == 0].sum()),
+            "exposed": int(civilian_weights[civilian_status == 1].sum()),
+            "infected": int(zombie_weights.sum()),
+            "rescued": self.rescued,
+            "dead": self.strike_casualties + getattr(self, "_eliminated_population", 0),
+        }
+        ledger["accounted"] = sum(value for key, value in ledger.items() if key != "starting")
+        return ledger
 
     def _update_simulation_status(self) -> None:
         total = max(1, self.represented_population)
         lost_or_rescued = self.rescued + self.casualties
         remaining = max(0, total - lost_or_rescued)
         zombies = len(self.zombies["x"])
-        susceptible = int(np.count_nonzero(self.civilians["status"] == 0))
-        if remaining <= max(self.people_per_agent * 5, round(total * 0.02)):
+        previous_status = self.simulation_status
+        if remaining <= max(1, round(total * 0.02)):
             self.simulation_status = "Collapsed"
             if self.infection_casualties >= self.strike_casualties:
                 self.collapse_cause = "Infection and exposure exhausted the remaining population."
             else:
                 self.collapse_cause = "Civilian casualties from air support exceeded infection losses."
+            if previous_status != "Collapsed":
+                self._record_containment_event(
+                    "Containment collapsed",
+                    self.collapse_cause,
+                    "collapsed",
+                    self._population_hotspots(),
+                )
             if self.auto_collapse:
                 self.end_reason = "POPULATION COLLAPSE"
                 self.screen_name = "analysis"
             return
         if zombies == 0 and self.infected_count == 0:
-            self.simulation_status = "Contained"
+            next_status = "Contained"
         elif lost_or_rescued / total >= 0.65 or zombies >= max(1, self.population_agents // 3):
-            self.simulation_status = "Critical"
+            next_status = "Critical"
         else:
-            self.simulation_status = "Spreading"
+            next_status = "Spreading"
+        self.simulation_status = next_status
+        if next_status != previous_status and next_status in ("Contained", "Critical"):
+            event_kind = next_status.lower()
+            if not any(event["kind"] == event_kind for event in self.containment_timeline):
+                self._record_containment_event(
+                    f"Containment {next_status.lower()}",
+                    f"{self._population_ledger()['infected']:,} residents infected",
+                    event_kind,
+                    self._population_hotspots(),
+                )
 
     def _stop_simulation(self) -> None:
         if self.screen_name != "active":
             return
         self.end_reason = "MANUAL STOP"
         self._update_simulation_status()
+        self._record_containment_event("Simulation stopped", self.simulation_status, "stopped")
         if self.screen_name == "active":
             self.screen_name = "analysis"
 
@@ -1433,8 +1840,11 @@ class Deadgrid:
         self.screen_name = "active"
         self.simulation_status = "Spreading"
         self.end_reason = ""
+        self.target_mode = None
+        self.barricade_drag_start = None
         self.phase_time = 0.0
         self._eliminated = 0
+        self._eliminated_population = 0
         self.simulation_time = 0.0
         if self.emergency_policy == "EVACUATE" and any(unit["kind"] == "EVAC STATION" for unit in self.units):
             self._set_emergency_policy(self.emergency_policy)
@@ -1627,8 +2037,9 @@ class Deadgrid:
         converted_count = int(np.count_nonzero(converted))
         if converted_count:
             converted_x, converted_y = crowd["x"][converted], crowd["y"][converted]
-            self.casualties += converted_count * self.people_per_agent
-            self.infection_casualties += converted_count * self.people_per_agent
+            converted_population = int(crowd["population"][converted].sum())
+            self.casualties += converted_population
+            self.infection_casualties += converted_population
             keep = ~converted
             self.civilians = {key: values[keep] for key, values in crowd.items()}
             zombies = self.zombies
@@ -1636,6 +2047,7 @@ class Deadgrid:
                 "x": np.concatenate((zombies["x"], converted_x)),
                 "y": np.concatenate((zombies["y"], converted_y)),
                 "hp": np.concatenate((zombies["hp"], np.full(converted_count, 40, dtype=np.float32))),
+                "population": np.concatenate((zombies.get("population", np.empty(0, dtype=np.int64)), crowd["population"][converted])),
                 "route_node": np.concatenate((zombies.get("route_node", np.empty(0, dtype=np.int32)), self._snap_agents_to_roads(converted_x, converted_y))),
                 "route_narrow": np.concatenate((zombies.get("route_narrow", np.zeros(len(zombies["x"]), dtype=bool)), np.zeros(converted_count, dtype=bool))),
             }
@@ -1658,6 +2070,7 @@ class Deadgrid:
     def _click(self, point: tuple[int, int], button: int) -> None:
         if button == 3:
             self.target_mode = None
+            self.barricade_drag_start = None
             return
         if button != 1:
             return
@@ -1740,6 +2153,12 @@ class Deadgrid:
                         self.evac_route_refresh = 0.0
                     self.target_mode = None
                     self._notify(f"{self.moving_unit['kind']} REPOSITIONED")
+                elif self.target_mode == "deploy":
+                    if self.selected_unit == "BARRICADE":
+                        self.barricade_drag_start = self._snap_barricade_anchor(self._world_point(point))
+                    else:
+                        self._deploy(point)
+                        self.target_mode = None
                 elif self.target_mode in ("strike", "gunship"):
                     self._air_support(point)
             elif self.hit_targets.get("launch", pygame.Rect(0, 0, 0, 0)).collidepoint(point):
@@ -1780,6 +2199,9 @@ class Deadgrid:
                     key = f"unit_{kind}"
                     if key in self.hit_targets and self.hit_targets[key].collidepoint(point):
                         self.selected_unit = kind
+                        self.target_mode = "deploy"
+                        self.barricade_drag_start = None
+                        self._notify(f"{kind} PREVIEW · CLICK MAP TO PLACE" if kind != "BARRICADE" else "BARRICADE PREVIEW · CLICK OR DRAG A WALL")
                         selected = True
                         break
                 if not selected and MAP_RECT.collidepoint(point):
@@ -1795,8 +2217,9 @@ class Deadgrid:
                         self.target_mode = "move"
                         self._notify(f"{asset['kind']} SELECTED · CLICK MAP TO REPOSITION")
                     else:
-                        self._deploy(point)
-                elif self.target_mode:
+                        self.target_mode = "deploy"
+                        self._notify(f"{self.selected_unit} PREVIEW · CLICK MAP TO PLACE" if self.selected_unit != "BARRICADE" else "BARRICADE PREVIEW · CLICK OR DRAG A WALL")
+                elif self.target_mode and not selected:
                     self.target_mode = None
         elif self.screen_name == "analysis":
             if self.hit_targets.get("restart_scenario", pygame.Rect(0, 0, 0, 0)).collidepoint(point):
@@ -1817,7 +2240,10 @@ class Deadgrid:
             self.mouse = point
             self._click(point, event.button)
         elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+            self.mouse = self._screen_position(event)
             self.dragging_radius = False
+            if self.barricade_drag_start is not None:
+                self._finish_barricade_drag(self.mouse)
         elif event.type == pygame.KEYDOWN:
             if self.screen_name == "config" and self.scenario_name_active:
                 if event.key == pygame.K_RETURN:
@@ -1836,10 +2262,12 @@ class Deadgrid:
             elif self.screen_name in ("deployment", "active"):
                 if event.key == pygame.K_ESCAPE:
                     self.target_mode = None
+                    self.barricade_drag_start = None
                 elif event.key == pygame.K_SPACE and self.screen_name == "active":
                     self.phase_time = -1 if self.phase_time >= 0 else 0
                 elif pygame.K_1 <= event.key <= pygame.K_6 and self.screen_name == "deployment":
                     self.selected_unit = list(UNITS)[event.key - pygame.K_1]
+                    self.target_mode = "deploy"
                 elif pygame.K_F1 <= event.key <= pygame.K_F4:
                     mode = ("risk", "horde", "exposed", "survivors")[event.key - pygame.K_F1]
                     self.intel_modes[mode] = not self.intel_modes[mode]
@@ -1892,6 +2320,54 @@ def self_test() -> None:
     city.population = 30_000
     assert len(city.roads) >= 10 and len(city.buildings) >= 20
     assert len(city.buildings) == len(city.building_weights)
+    layer_test = Deadgrid()
+    layer_surface = pygame.Surface((WIDTH, HEIGHT))
+    layer_city = CityMap(
+        "Layer order test",
+        roads=[[(0.1, 0.5), (0.9, 0.5)]],
+        road_types=["primary"],
+        buildings=[[(0.3, 0.3), (0.7, 0.3), (0.7, 0.7), (0.3, 0.7)]],
+        water=[[(0.05, 0.05), (0.2, 0.05), (0.2, 0.2), (0.05, 0.2), (0.05, 0.05)]],
+        building_types=["civic"],
+    )
+    layer_test._draw_city(layer_surface, MAP_RECT, layer_city)
+    road_pixel = layer_surface.get_at(layer_test._map_point(0.5, 0.5))[:3]
+    building_pixel = layer_surface.get_at(layer_test._map_point(0.34, 0.34))[:3]
+    water_pixel = layer_surface.get_at(layer_test._map_point(0.1, 0.1))[:3]
+    assert road_pixel in {(107, 122, 119), (211, 210, 185), (169, 151, 108)}
+    assert building_pixel == (176, 151, 132) and water_pixel == (91, 153, 166)
+    layer_test.intel_modes = {mode: True for mode in ("risk", "horde", "exposed", "survivors")}
+    layer_test.intel_layers = {mode: pygame.Surface(MAP_RECT.size, pygame.SRCALPHA) for mode in layer_test.intel_modes}
+    assert len(layer_test._draw_intelligence(layer_surface)) == 4
+
+    preview_game = Deadgrid()
+    preview_game._begin_operation(CityMap("Placement preview test", population=1000))
+    preview_point = (MAP_RECT.x + 100, MAP_RECT.y + 100)
+    preview_game._click(preview_point, 1)
+    assert not preview_game.units and preview_game.target_mode == "deploy"
+    preview_game._draw_operation(False)
+    preview_game._click(preview_point, 1)
+    assert len(preview_game.units) == 1 and preview_game.target_mode is None
+
+    wall_game = Deadgrid()
+    wall_city = CityMap(
+        "Barricade drag test",
+        population=1000,
+        buildings=[[(0.2, 0.3), (0.3, 0.3), (0.3, 0.4), (0.2, 0.4)]],
+    )
+    wall_game._begin_operation(wall_city)
+    wall_game._draw_operation(False)
+    wall_game._click(wall_game.hit_targets["unit_BARRICADE"].center, 1)
+    wall_start = (round(MAP_RECT.x + 0.204 * MAP_RECT.w), round(MAP_RECT.y + 0.35 * MAP_RECT.h))
+    wall_end = (round(MAP_RECT.x + 0.296 * MAP_RECT.w), round(MAP_RECT.y + 0.35 * MAP_RECT.h))
+    wall_game._handle_event(pygame.event.Event(pygame.MOUSEBUTTONDOWN, {"pos": wall_start, "button": 1}))
+    wall_game._handle_event(pygame.event.Event(pygame.MOUSEMOTION, {"pos": wall_end, "buttons": (True, False, False)}))
+    wall_game._draw_operation(False)
+    wall_game._handle_event(pygame.event.Event(pygame.MOUSEBUTTONUP, {"pos": wall_end, "button": 1}))
+    wall_posts = [unit for unit in wall_game.units if unit["kind"] == "BARRICADE"]
+    assert len(wall_posts) == 4 and wall_game.budget == 1500 - 4 * UNITS["BARRICADE"]["cost"]
+    assert wall_posts[0]["x"] == 200 and wall_posts[-1]["x"] == 300
+
     street_nodes, street_graph, street_edges = _build_road_graph(city)
     crossing = int(np.argmin((street_nodes[:, 0] - 450) ** 2 + (street_nodes[:, 1] - 308) ** 2))
     assert len(street_graph[crossing]) >= 4
@@ -1938,7 +2414,10 @@ def self_test() -> None:
     route_failure_game.civilians["route_node"] = route_failure_game._snap_agents_to_roads(route_failure_game.civilians["x"], route_failure_game.civilians["y"])
     route_failure_game.units.append({"kind": "EVAC STATION", "x": 100.0, "y": 350.0, "range": 64, "route_node": int(route_failure_game._snap_agents_to_roads(np.array([100]), np.array([350]))[0])})
     route_failure_game._rebuild_evac_routes(np.zeros((GRID_H, GRID_W), dtype=np.float32))
-    assert route_failure_game.route_failure_agents == 8 and route_failure_game.route_failure_locations
+    assert route_failure_game.route_failure_agents == 8 and route_failure_game.route_failure_population == 8
+    assert route_failure_game.route_failure_locations
+    route_event = route_failure_game.containment_timeline[-1]
+    assert route_event["kind"] == "route_failure" and route_event["locations"]
     assert _parse_population("2,133,111") == 2_133_111
     assert _parse_population("1.5 million") == 1_500_000
 
@@ -2006,6 +2485,26 @@ def self_test() -> None:
     assert game.screen_name == "deployment" and len(game.civilians["x"]) == game.population_agents - expected_initial_zombies
     assert game.population_agents == 30_000 and len(game.zombies["x"]) == 1_500
 
+    accounting_game = Deadgrid()
+    accounting_game._begin_operation(CityMap("Population accounting test", population=10_000_003))
+    cohort_populations = np.concatenate((accounting_game.civilians["population"], accounting_game.zombies["population"]))
+    assert accounting_game.population_agents == 50_000
+    assert accounting_game.represented_population == 10_000_003 == int(cohort_populations.sum())
+    assert accounting_game.initial_infected_population == int(accounting_game.zombies["population"].sum())
+    assert int(cohort_populations.max()) - int(cohort_populations.min()) <= 1
+    ledger = accounting_game._population_ledger()
+    assert ledger["accounted"] == ledger["starting"] == 10_000_003
+    accounting_game.civilians["status"][0] = 1
+    ledger = accounting_game._population_ledger()
+    assert ledger["exposed"] == int(accounting_game.civilians["population"][0])
+    assert ledger["accounted"] == ledger["starting"]
+    accounting_game.zombies["hp"][0] = 0
+    zombie_x, zombie_y = accounting_game.zombies["x"][0], accounting_game.zombies["y"][0]
+    accounting_game._damage_zombies(float(zombie_x), float(zombie_y), 0.01, 1)
+    ledger = accounting_game._population_ledger()
+    assert ledger["dead"] == accounting_game._eliminated_population
+    assert ledger["accounted"] == ledger["starting"]
+
     contained_game = Deadgrid()
     contained_game._begin_operation(CityMap("Containment test", population=10_000))
     contained_game.zombies = {"x": np.empty(0, dtype=np.float32), "y": np.empty(0, dtype=np.float32), "hp": np.empty(0, dtype=np.float32), "route_node": np.empty(0, dtype=np.int32), "route_narrow": np.empty(0, dtype=bool)}
@@ -2014,6 +2513,8 @@ def self_test() -> None:
     assert contained_game.screen_name == "active" and contained_game.simulation_status == "Contained"
     contained_game._stop_simulation()
     assert contained_game.screen_name == "analysis" and contained_game.end_reason == "MANUAL STOP"
+    contained_game._render()
+    assert contained_game.hit_targets["restart_scenario"]
     collapse_game = Deadgrid()
     collapse_game._begin_operation(CityMap("Collapse test", population=1000))
     collapse_game._start_simulation()
