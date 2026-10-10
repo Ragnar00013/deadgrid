@@ -27,7 +27,9 @@ one with `PYTHON_BIN=/usr/bin/python3.12 bash build_linux.sh`.
 The Linux executable is written to `dist/linux/DEADGRID`. On Windows, run
 `build_windows.bat`; it creates `dist\windows\DEADGRID.exe`. PyInstaller does
 not cross-compile Windows executables from Linux, so the `.exe` build must run
-on Windows. Launching either build works offline with the generated city; live
+on Windows. The batch file detects `python` or the `py` launcher and pauses with
+the error visible if a dependency or build step fails. Launching either build
+works offline with the generated city; live
 place lookup still requires internet access. The standalone build includes the
 core game dependencies; the optional Overture/geospatial supplement remains
 available when running from source with `requirements.txt`. Saved scenarios go
