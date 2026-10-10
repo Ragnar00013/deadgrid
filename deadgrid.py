@@ -31,6 +31,9 @@ AREA_MAP_RECT = pygame.Rect(220, 112, 920, 594)
 WORLD_MAP_RECT = pygame.Rect(352, 0, WIDTH - 352, HEIGHT)
 WORLD_TILE_SIZE = 256
 MIN_WORLD_ZOOM, MAX_WORLD_ZOOM = 2, 18
+MIN_OPERATION_ZOOM, MAX_OPERATION_ZOOM = 1.0, 5.0
+MAX_BARRICADE_DURABILITY = 180.0
+ZOMBIE_BARRICADE_ATTACK_RANGE = 22.0
 _SURFACE_TRANSFORMS: weakref.WeakKeyDictionary[pygame.Surface, tuple[float, float, float, float]] = weakref.WeakKeyDictionary()
 
 
@@ -172,7 +175,7 @@ UNITS = {
     "SENTRY": {"cost": 300, "range": 140, "damage": 12, "rate": 0.45, "color": (183, 216, 111), "description": "FAST AUTO-FIRE / CONTROL"},
     "MORTAR": {"cost": 440, "range": 275, "damage": 38, "rate": 2.3, "color": (232, 173, 96), "description": "AREA BLAST / SLOW RELOAD"},
     "RIFLE SQUAD": {"cost": 350, "range": 125, "damage": 18, "rate": 0.7, "color": (126, 168, 209), "description": "RELIABLE CLOSE DEFENSE"},
-    "BARRICADE": {"cost": 80, "range": 0, "damage": 0, "rate": 0, "color": (210, 182, 127), "description": "SLOWS THE CROWD"},
+    "BARRICADE": {"cost": 80, "range": 0, "damage": 0, "rate": 0, "color": (153, 91, 48), "description": "SOLID WALL / BLOCKS HORDE"},
     "EVAC STATION": {"cost": 175, "range": 64, "damage": 0, "rate": 0, "color": (115, 189, 211), "description": "STREET EXTRACTION / 14 AGENTS SEC"},
     "SAFE ZONE": {"cost": 420, "range": 128, "damage": 0, "rate": 0, "color": (106, 190, 150), "description": "SHELTER / CAPACITY 6,000 PEOPLE"},
     "SUPPLY DROP": {"cost": 100, "range": 0, "damage": 0, "rate": 0, "color": (213, 195, 127), "description": "AIRDROP / +$400 AFTER 8 SEC"},
@@ -243,7 +246,18 @@ def _tile_cache_root() -> Path:
         root = Path.home() / "Library" / "Caches"
     else:
         root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
-    return root / "Deadgrid" / "map_tiles"
+    return root / "Deadgrid" / "osm_map_tiles"
+
+
+def _darken_world_tile(surface: pygame.Surface) -> None:
+    rgb = pygame.surfarray.pixels3d(surface)
+    inverted = 255.0 - rgb.astype(np.float32)
+    rgb[:] = np.clip(
+        np.array((13, 20, 23), dtype=np.float32) + inverted * 0.46,
+        0,
+        180,
+    ).astype(np.uint8)
+    del rgb
 
 
 def search_places(place: str) -> list[PlaceSearchResult]:
@@ -851,7 +865,7 @@ class MapWorker:
 class MapTileWorker:
     """Fetch and persist map tiles without blocking pygame's event loop."""
 
-    url_template = "https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png"
+    url_template = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
 
     def __init__(self, cache_dir: Path | None = None) -> None:
         self.cache_dir = cache_dir or _tile_cache_root()
@@ -897,7 +911,7 @@ class MapTileWorker:
                 if path.is_file():
                     tile_data = path.read_bytes()
                 else:
-                    wait = 0.25 - (time.monotonic() - last_network_request)
+                    wait = 0.6 - (time.monotonic() - last_network_request)
                     if wait > 0:
                         time.sleep(wait)
                     zoom, x, y = key
@@ -985,6 +999,10 @@ class Deadgrid:
         self.area_map_scale = 0
         self.area_pan_drag = False
         self.area_pan_last = (0, 0)
+        self.operation_zoom = 1.0
+        self.operation_view_center = (0.5, 0.5)
+        self.operation_pan_drag = False
+        self.operation_pan_last = (0, 0)
         self.fullscreen = False
         self.resolution_1080 = True
         self.windowed_size = (WIDTH, HEIGHT)
@@ -1031,12 +1049,14 @@ class Deadgrid:
         self.road_edge_midpoints = np.empty((0, 2), dtype=np.float32)
         self.building_blocked_grid = np.zeros((COLLISION_GRID_H, COLLISION_GRID_W), dtype=bool)
         self.water_blocked_grid = np.zeros((COLLISION_GRID_H, COLLISION_GRID_W), dtype=bool)
+        self.barricade_blocked_grid = np.zeros((COLLISION_GRID_H, COLLISION_GRID_W), dtype=bool)
         self.collision_grid = np.zeros((COLLISION_GRID_H, COLLISION_GRID_W), dtype=bool)
         self.nearest_walkable_grid = np.arange(
             COLLISION_GRID_H * COLLISION_GRID_W, dtype=np.int32
         ).reshape((COLLISION_GRID_H, COLLISION_GRID_W))
         self._penalized_edge_keys: set[tuple[int, int]] = set()
-        self._barricade_signature: tuple[tuple[float, float], ...] | None = None
+        self._barricade_blocked_edge_keys: set[tuple[int, int]] = set()
+        self._barricade_signature: tuple[tuple[float, ...], ...] | None = None
         self._barricade_slow_grid = np.ones((GRID_H, GRID_W), dtype=np.float32)
         self.road_next_nodes = np.empty(0, dtype=np.int32)
         self.road_next_narrow = np.zeros(0, dtype=bool)
@@ -1427,6 +1447,8 @@ class Deadgrid:
 
     def _begin_operation(self, city: CityMap) -> None:
         self.city = city
+        self.operation_zoom = 1.0
+        self.operation_view_center = (0.5, 0.5)
         self.city_surface_cache.clear()
         self.intel_grids = {key: np.zeros((GRID_H, GRID_W), dtype=np.float32) for key in self.intel_modes}
         self.intel_layers = {}
@@ -1559,11 +1581,43 @@ class Deadgrid:
 
     def _map_point(self, nx: float, ny: float) -> tuple[int, int]:
         rect = self._map_content_rect()
-        return int(rect.x + nx * rect.w), int(rect.y + ny * rect.h)
+        return (
+            int(rect.centerx + (nx - self.operation_view_center[0]) * rect.w * self.operation_zoom),
+            int(rect.centery + (ny - self.operation_view_center[1]) * rect.h * self.operation_zoom),
+        )
 
     def _world_point(self, point: tuple[int, int]) -> tuple[float, float]:
         rect = self._map_content_rect()
-        return ((point[0] - rect.x) / rect.w * WORLD_W, (point[1] - rect.y) / rect.h * WORLD_H)
+        return (
+            (self.operation_view_center[0] + (point[0] - rect.centerx) / (rect.w * self.operation_zoom)) * WORLD_W,
+            (self.operation_view_center[1] + (point[1] - rect.centery) / (rect.h * self.operation_zoom)) * WORLD_H,
+        )
+
+    def _limit_operation_view(self) -> None:
+        half_view = 0.5 / self.operation_zoom
+        self.operation_view_center = (
+            max(half_view, min(1.0 - half_view, self.operation_view_center[0])),
+            max(half_view, min(1.0 - half_view, self.operation_view_center[1])),
+        )
+
+    def _zoom_operation(self, factor: float, anchor: tuple[int, int]) -> None:
+        rect = self._map_content_rect()
+        anchor_x = self.operation_view_center[0] + (anchor[0] - rect.centerx) / (rect.w * self.operation_zoom)
+        anchor_y = self.operation_view_center[1] + (anchor[1] - rect.centery) / (rect.h * self.operation_zoom)
+        self.operation_zoom = max(MIN_OPERATION_ZOOM, min(MAX_OPERATION_ZOOM, self.operation_zoom * factor))
+        self.operation_view_center = (
+            anchor_x - (anchor[0] - rect.centerx) / (rect.w * self.operation_zoom),
+            anchor_y - (anchor[1] - rect.centery) / (rect.h * self.operation_zoom),
+        )
+        self._limit_operation_view()
+
+    def _pan_operation(self, dx: int, dy: int) -> None:
+        rect = self._map_content_rect()
+        self.operation_view_center = (
+            self.operation_view_center[0] - dx / (rect.w * self.operation_zoom),
+            self.operation_view_center[1] - dy / (rect.h * self.operation_zoom),
+        )
+        self._limit_operation_view()
 
     def _prepare_collision_grid(self, city: CityMap) -> None:
         building_surface = pygame.Surface((COLLISION_GRID_W, COLLISION_GRID_H))
@@ -1605,11 +1659,14 @@ class Deadgrid:
             pygame.draw.lines(water_surface, (255, 255, 255), False, points, line_width)
         self.water_blocked_grid = pygame.surfarray.array2d(water_surface).T != 0
         self.collision_grid = self.building_blocked_grid | self.water_blocked_grid
+        self.barricade_blocked_grid = np.zeros_like(self.collision_grid)
+        self._rebuild_nearest_walkable_grid()
 
-        walkable = ~self.collision_grid
+    def _rebuild_nearest_walkable_grid(self, *, block_barricades: bool = False) -> None:
+        blocked = self.collision_grid | self.barricade_blocked_grid if block_barricades else self.collision_grid
+        walkable = ~blocked
         if not np.any(walkable):
-            self.collision_grid.fill(False)
-            walkable = ~self.collision_grid
+            walkable = np.ones_like(blocked)
         nearest = np.full((COLLISION_GRID_H, COLLISION_GRID_W), -1, dtype=np.int32)
         queue_cells = deque()
         for y, x in np.argwhere(walkable):
@@ -1626,24 +1683,39 @@ class Deadgrid:
                     queue_cells.append(next_y * COLLISION_GRID_W + next_x)
         self.nearest_walkable_grid = nearest
 
-    def _blocked_at(self, x: np.ndarray, y: np.ndarray, *, allow_water: bool = False) -> np.ndarray:
+    def _blocked_at(
+        self,
+        x: np.ndarray,
+        y: np.ndarray,
+        *,
+        allow_water: bool = False,
+        block_barricades: bool = False,
+    ) -> np.ndarray:
         grid_x = np.clip((np.asarray(x) * (COLLISION_GRID_W / WORLD_W)).astype(np.int32), 0, COLLISION_GRID_W - 1)
         grid_y = np.clip((np.asarray(y) * (COLLISION_GRID_H / WORLD_H)).astype(np.int32), 0, COLLISION_GRID_H - 1)
         blocked = self.building_blocked_grid[grid_y, grid_x]
         if not allow_water:
             blocked = blocked | self.water_blocked_grid[grid_y, grid_x]
+        if block_barricades:
+            blocked = blocked | self.barricade_blocked_grid[grid_y, grid_x]
         return blocked
 
-    def _segment_is_walkable(self, start: tuple[float, float], end: tuple[float, float]) -> bool:
+    def _segment_is_walkable(
+        self,
+        start: tuple[float, float],
+        end: tuple[float, float],
+        *,
+        block_barricades: bool = False,
+    ) -> bool:
         distance = max(abs(end[0] - start[0]), abs(end[1] - start[1]))
         sample_count = max(1, math.ceil(distance / COLLISION_STEP))
         fractions = np.linspace(0.0, 1.0, sample_count + 1, dtype=np.float32)
         x = start[0] + (end[0] - start[0]) * fractions
         y = start[1] + (end[1] - start[1]) * fractions
-        return not bool(np.any(self._blocked_at(x, y)))
+        return not bool(np.any(self._blocked_at(x, y, block_barricades=block_barricades)))
 
-    def _resolve_blocked_positions(self, x: np.ndarray, y: np.ndarray) -> None:
-        blocked = self._blocked_at(x, y)
+    def _resolve_blocked_positions(self, x: np.ndarray, y: np.ndarray, *, block_barricades: bool = False) -> None:
+        blocked = self._blocked_at(x, y, block_barricades=block_barricades)
         if not np.any(blocked):
             return
         grid_x = np.clip((x[blocked] * (COLLISION_GRID_W / WORLD_W)).astype(np.int32), 0, COLLISION_GRID_W - 1)
@@ -1652,14 +1724,22 @@ class Deadgrid:
         x[blocked] = ((nearest % COLLISION_GRID_W) + 0.5) * (WORLD_W / COLLISION_GRID_W)
         y[blocked] = ((nearest // COLLISION_GRID_W) + 0.5) * (WORLD_H / COLLISION_GRID_H)
 
-    def _move_with_collision(self, x: np.ndarray, y: np.ndarray, dx: np.ndarray, dy: np.ndarray) -> None:
+    def _move_with_collision(
+        self,
+        x: np.ndarray,
+        y: np.ndarray,
+        dx: np.ndarray,
+        dy: np.ndarray,
+        *,
+        block_barricades: bool = False,
+    ) -> None:
         candidate_x = np.clip(x + dx, 2, WORLD_W - 2)
         distance_x = np.abs(candidate_x - x)
         sample_count = max(1, math.ceil(float(np.max(distance_x, initial=0.0)) / COLLISION_STEP))
         blocked_x = np.zeros(len(x), dtype=bool)
         for step in range(1, sample_count + 1):
             fraction = min(1.0, step / sample_count)
-            blocked_x |= self._blocked_at(x + (candidate_x - x) * fraction, y)
+            blocked_x |= self._blocked_at(x + (candidate_x - x) * fraction, y, block_barricades=block_barricades)
         x += np.where(blocked_x, 0.0, candidate_x - x)
 
         candidate_y = np.clip(y + dy, 2, WORLD_H - 2)
@@ -1668,7 +1748,7 @@ class Deadgrid:
         blocked_y = np.zeros(len(y), dtype=bool)
         for step in range(1, sample_count + 1):
             fraction = min(1.0, step / sample_count)
-            blocked_y |= self._blocked_at(x, y + (candidate_y - y) * fraction)
+            blocked_y |= self._blocked_at(x, y + (candidate_y - y) * fraction, block_barricades=block_barricades)
         y += np.where(blocked_y, 0.0, candidate_y - y)
 
     def _prepare_road_network(self, city: CityMap) -> None:
@@ -1702,6 +1782,7 @@ class Deadgrid:
             [(edge[3], edge[4]) for edge in self.road_edges], dtype=np.float32
         ).reshape((-1, 2))
         self._penalized_edge_keys = set()
+        self._barricade_blocked_edge_keys = set()
         self._barricade_signature = None
         self._barricade_slow_grid = np.ones((GRID_H, GRID_W), dtype=np.float32)
         self.road_node_bins = {}
@@ -1754,24 +1835,57 @@ class Deadgrid:
         cell_y = np.clip((y * (GRID_H / WORLD_H)).astype(np.int32), 0, GRID_H - 1)
         return self.road_snap_grid[cell_y, cell_x].copy()
 
+    @staticmethod
+    def _barricade_segment(unit: dict[str, Any]) -> tuple[tuple[float, float], tuple[float, float]]:
+        if "wall_start" in unit and "wall_end" in unit:
+            return tuple(unit["wall_start"]), tuple(unit["wall_end"])
+        x, y = float(unit["x"]), float(unit["y"])
+        return (x - 24.0, y), (x + 24.0, y)
+
+    @staticmethod
+    def _barricade_health_color(unit: dict[str, Any]) -> tuple[int, int, int]:
+        health = max(0.0, min(1.0, float(unit.get("durability", MAX_BARRICADE_DURABILITY)) / MAX_BARRICADE_DURABILITY))
+        if health >= 0.5:
+            fraction = (1.0 - health) * 2.0
+            colors = ((153, 91, 48), (207, 133, 61))
+        else:
+            fraction = (0.5 - health) * 2.0
+            colors = ((207, 133, 61), (103, 55, 36))
+        return tuple(round(first + (second - first) * fraction) for first, second in zip(*colors))
+
     def _refresh_barricade_caches(self) -> None:
+        barricades = [unit for unit in self.units if unit["kind"] == "BARRICADE"]
+        segments = [self._barricade_segment(unit) for unit in barricades]
         signature = tuple(
-            (float(unit["x"]), float(unit["y"]))
-            for unit in self.units
-            if unit["kind"] == "BARRICADE"
+            (float(unit["x"]), float(unit["y"]), *start, *end)
+            for unit, (start, end) in zip(barricades, segments)
         )
         if signature == self._barricade_signature:
             return
         self._barricade_signature = signature
         self._penalized_edge_keys = set()
+        self._barricade_blocked_edge_keys = set()
         self._barricade_slow_grid = np.ones((GRID_H, GRID_W), dtype=np.float32)
-        if not signature:
-            return
-
         grid_y, grid_x = np.ogrid[:GRID_H, :GRID_W]
         cell_x = (grid_x + 0.5) * WORLD_W / GRID_W
         cell_y = (grid_y + 0.5) * WORLD_H / GRID_H
-        for barricade_x, barricade_y in signature:
+        barrier_surface = pygame.Surface((COLLISION_GRID_W, COLLISION_GRID_H))
+        barrier_surface.fill((0, 0, 0))
+        line_width = max(
+            1,
+            round(12 * (COLLISION_GRID_W / WORLD_W + COLLISION_GRID_H / WORLD_H) / 2),
+        )
+        for unit, (start, end) in zip(barricades, segments):
+            barricade_x, barricade_y = float(unit["x"]), float(unit["y"])
+            start_pixel = (
+                round(start[0] * (COLLISION_GRID_W - 1) / WORLD_W),
+                round(start[1] * (COLLISION_GRID_H - 1) / WORLD_H),
+            )
+            end_pixel = (
+                round(end[0] * (COLLISION_GRID_W - 1) / WORLD_W),
+                round(end[1] * (COLLISION_GRID_H - 1) / WORLD_H),
+            )
+            pygame.draw.line(barrier_surface, (255, 255, 255), start_pixel, end_pixel, line_width)
             if len(self.road_edge_midpoints):
                 dx = self.road_edge_midpoints[:, 0] - barricade_x
                 dy = self.road_edge_midpoints[:, 1] - barricade_y
@@ -1781,6 +1895,20 @@ class Deadgrid:
 
             near = (cell_x - barricade_x) ** 2 + (cell_y - barricade_y) ** 2 < 38 ** 2
             self._barricade_slow_grid[near] *= 0.28
+        self.barricade_blocked_grid = pygame.surfarray.array2d(barrier_surface).T != 0
+        for edge in self.road_edges:
+            first, second = int(edge[0]), int(edge[1])
+            start = tuple(float(value) for value in self.road_nodes[first])
+            end = tuple(float(value) for value in self.road_nodes[second])
+            if not self._segment_is_walkable(start, end, block_barricades=True):
+                self._barricade_blocked_edge_keys.add((min(first, second), max(first, second)))
+        self._rebuild_nearest_walkable_grid(block_barricades=bool(signature))
+        if signature and len(self.zombies.get("x", ())):
+            self._resolve_blocked_positions(
+                self.zombies["x"],
+                self.zombies["y"],
+                block_barricades=True,
+            )
 
     def _rebuild_road_routes(self, occupancy: np.ndarray) -> None:
         if not self.road_adjacency:
@@ -1822,6 +1950,8 @@ class Deadgrid:
                 continue
             for neighbor, edge_cost, _, is_narrow in self.road_adjacency[node]:
                 edge_key = (min(node, neighbor), max(node, neighbor))
+                if edge_key in self._barricade_blocked_edge_keys:
+                    continue
                 if edge_key in self._penalized_edge_keys:
                     edge_cost *= 22.0
                 candidate_cost = current_cost + edge_cost
@@ -1871,6 +2001,8 @@ class Deadgrid:
                 continue
             for neighbor, edge_cost, _, is_narrow in self.road_adjacency[node]:
                 edge_key = (min(node, neighbor), max(node, neighbor))
+                if edge_key in self._barricade_blocked_edge_keys:
+                    continue
                 if edge_key in self._penalized_edge_keys:
                     edge_cost *= 22.0
                 edge_cost *= 1.0 + min(16.0, pressure_flat[self.road_node_cell[neighbor]] * 0.7)
@@ -2075,8 +2207,14 @@ class Deadgrid:
         map_rect = self._map_content_rect()
         transform = _surface_transform(surface)
         if len(civilians["x"]):
-            logical_x = (map_rect.x + civilians["x"] / WORLD_W * map_rect.w).astype(np.int32)
-            logical_y = (map_rect.y + civilians["y"] / WORLD_H * map_rect.h).astype(np.int32)
+            logical_x = (
+                map_rect.centerx
+                + (civilians["x"] / WORLD_W - self.operation_view_center[0]) * map_rect.w * self.operation_zoom
+            ).astype(np.int32)
+            logical_y = (
+                map_rect.centery
+                + (civilians["y"] / WORLD_H - self.operation_view_center[1]) * map_rect.h * self.operation_zoom
+            ).astype(np.int32)
             if transform:
                 scale_x, scale_y, offset_x, offset_y = transform
                 logical_x = np.rint(logical_x * scale_x + offset_x).astype(np.int32)
@@ -2094,8 +2232,14 @@ class Deadgrid:
             pixel_right = round(map_rect.right * transform[0] + transform[2]) - 1 if transform else map_rect.right - 1
             pixels[np.minimum(pixels_x + 1, pixel_right), pixels_y] = colors
         if len(self.zombies["x"]):
-            logical_x = (map_rect.x + self.zombies["x"] / WORLD_W * map_rect.w).astype(np.int32)
-            logical_y = (map_rect.y + self.zombies["y"] / WORLD_H * map_rect.h).astype(np.int32)
+            logical_x = (
+                map_rect.centerx
+                + (self.zombies["x"] / WORLD_W - self.operation_view_center[0]) * map_rect.w * self.operation_zoom
+            ).astype(np.int32)
+            logical_y = (
+                map_rect.centery
+                + (self.zombies["y"] / WORLD_H - self.operation_view_center[1]) * map_rect.h * self.operation_zoom
+            ).astype(np.int32)
             if transform:
                 scale_x, scale_y, offset_x, offset_y = transform
                 left, top = round(map_rect.x * scale_x + offset_x), round(map_rect.y * scale_y + offset_y)
@@ -2467,7 +2611,7 @@ class Deadgrid:
         draw.rect(surface, LINE, map_rect, 1)
         self._button(surface, "map_zoom_in", pygame.Rect(map_rect.right - 54, map_rect.y + 18, 36, 32), "+", accent=CYAN)
         self._button(surface, "map_zoom_out", pygame.Rect(map_rect.right - 54, map_rect.y + 58, 36, 32), "−", accent=CYAN)
-        attribution = "© OpenStreetMap contributors  ·  CARTO"
+        attribution = "© OpenStreetMap contributors"
         self._text(surface, attribution, map_rect.x + 14, map_rect.bottom - 20, TEXT if any_tile else MUTED, self.small)
         if not any_tile:
             map_status = "WORLD MAP TILES UNAVAILABLE · CHECK CONNECTION" if visible_failures else "LOADING WORLD MAP  ·  MAP REMAINS AVAILABLE FROM CACHE OFFLINE"
@@ -2574,7 +2718,7 @@ class Deadgrid:
         self._text(surface, self.message if self.message_timer > 0 else f"SAVED SCENARIOS  {len(self.saved_scenarios)}", 68, 807, MUTED, self.small)
 
     def _draw_map_overlay(self, surface: pygame.Surface) -> None:
-        self._draw_city(surface, MAP_RECT, self.city)
+        self._draw_city(surface, MAP_RECT, self.city, self.operation_zoom, self.operation_view_center)
         intel_labels = self._draw_intelligence(surface)
 
         # Moving cohorts stay above the intelligence heatmaps.
@@ -2583,8 +2727,8 @@ class Deadgrid:
 
         for effect in self.effects:
             progress = effect["age"] / effect["duration"]
-            radius_x = max(1, round(effect["radius"] * (0.45 + progress * 0.7) * map_rect.w / WORLD_W))
-            radius_y = max(1, round(effect["radius"] * (0.45 + progress * 0.7) * map_rect.h / WORLD_H))
+            radius_x = max(1, round(effect["radius"] * (0.45 + progress * 0.7) * map_rect.w / WORLD_W * self.operation_zoom))
+            radius_y = max(1, round(effect["radius"] * (0.45 + progress * 0.7) * map_rect.h / WORLD_H * self.operation_zoom))
             color = AMBER if effect["kind"] == "strike" else CYAN
             center = self._map_point(effect["x"] / WORLD_W, effect["y"] / WORLD_H)
             draw.ellipse(surface, color, pygame.Rect(center[0] - radius_x, center[1] - radius_y, radius_x * 2, radius_y * 2), 2)
@@ -2595,8 +2739,24 @@ class Deadgrid:
             kind = structure["kind"]
             data = UNITS[kind]
             if kind == "BARRICADE":
-                draw.circle(surface, (165, 135, 83), center, 10, 2)
-                draw.line(surface, data["color"], (center[0] - 8, center[1] - 5), (center[0] + 8, center[1] + 5), 3)
+                wall_start, wall_end = self._barricade_segment(structure)
+                start_point = self._map_point(wall_start[0] / WORLD_W, wall_start[1] / WORLD_H)
+                end_point = self._map_point(wall_end[0] / WORLD_W, wall_end[1] / WORLD_H)
+                wall_width = max(4, round(12 * map_rect.w / WORLD_W * self.operation_zoom))
+                draw.line(surface, (55, 37, 27), start_point, end_point, wall_width + 4)
+                wall_color = self._barricade_health_color(structure)
+                draw.line(surface, wall_color, start_point, end_point, wall_width)
+                draw.circle(surface, wall_color, start_point, wall_width // 2)
+                draw.circle(surface, wall_color, end_point, wall_width // 2)
+                durability = float(structure.get("durability", MAX_BARRICADE_DURABILITY))
+                if durability < MAX_BARRICADE_DURABILITY * 0.65:
+                    midpoint = ((start_point[0] + end_point[0]) // 2, (start_point[1] + end_point[1]) // 2)
+                    dx, dy = end_point[0] - start_point[0], end_point[1] - start_point[1]
+                    length = max(1.0, math.hypot(dx, dy))
+                    crack = max(3, wall_width // 2)
+                    crack_start = (round(midpoint[0] - dy / length * crack), round(midpoint[1] + dx / length * crack))
+                    crack_end = (round(midpoint[0] + dy / length * crack), round(midpoint[1] - dx / length * crack))
+                    draw.line(surface, (55, 37, 27), crack_start, crack_end, max(1, wall_width // 3))
             elif kind in ("EVAC STATION", "SAFE ZONE"):
                 draw.circle(surface, data["color"], center, 9, 2)
                 draw.line(surface, data["color"], (center[0] - 4, center[1]), (center[0] + 4, center[1]), 2)
@@ -2632,8 +2792,8 @@ class Deadgrid:
         draw.circle(surface, RED, infection, 4)
         if self.moving_unit in self.units:
             center = self._map_point(self.moving_unit["x"] / WORLD_W, self.moving_unit["y"] / WORLD_H)
-            radius_x = max(1, round(self.moving_unit["range"] * map_rect.w / WORLD_W))
-            radius_y = max(1, round(self.moving_unit["range"] * map_rect.h / WORLD_H))
+            radius_x = max(1, round(self.moving_unit["range"] * map_rect.w / WORLD_W * self.operation_zoom))
+            radius_y = max(1, round(self.moving_unit["range"] * map_rect.h / WORLD_H * self.operation_zoom))
             draw.ellipse(surface, UNITS[self.moving_unit["kind"]]["color"], pygame.Rect(center[0] - radius_x, center[1] - radius_y, radius_x * 2, radius_y * 2), 1)
             draw.circle(surface, TEXT, center, 14, 1)
         self._text(surface, "PATIENT ZERO", infection[0] + 10, infection[1] - 20, RED, self.small)
@@ -2642,25 +2802,27 @@ class Deadgrid:
             self._text(surface, title[:86], MAP_RECT.right - 390, MAP_RECT.y + 13, TEXT, self.small)
         if self.target_mode:
             cursor = self._map_point(*self._target_preview())
-            color = RED if self.target_mode == "origin" else (AMBER if self.target_mode in ("strike", "deploy") else CYAN)
+            color = RED if self.target_mode == "origin" else (UNITS["BARRICADE"]["color"] if self.target_mode == "deploy" and self.selected_unit == "BARRICADE" else (AMBER if self.target_mode in ("strike", "deploy") else CYAN))
             if self.target_mode == "deploy" and self.selected_unit == "BARRICADE":
                 if self.barricade_drag_start:
                     end = self._snap_barricade_anchor(self._world_point(cursor))
                     start = self.barricade_drag_start
                     start_point = self._map_point(start[0] / WORLD_W, start[1] / WORLD_H)
                     end_point = self._map_point(end[0] / WORLD_W, end[1] / WORLD_H)
-                    draw.line(surface, (34, 42, 39), start_point, end_point, 9)
-                    draw.line(surface, AMBER, start_point, end_point, 4)
+                    preview_width = max(4, round(12 * map_rect.w / WORLD_W * self.operation_zoom))
+                    draw.line(surface, (55, 37, 27), start_point, end_point, preview_width + 4)
+                    draw.line(surface, UNITS["BARRICADE"]["color"], start_point, end_point, preview_width)
                     length = math.dist(start, end)
-                    count = max(1, math.ceil(length / 48.0) + (1 if length >= 18.0 else 0))
-                    for index in range(count):
-                        fraction = index / max(1, count - 1)
-                        post = (round(start_point[0] + (end_point[0] - start_point[0]) * fraction), round(start_point[1] + (end_point[1] - start_point[1]) * fraction))
-                        draw.circle(surface, AMBER, post, 5, 2)
-                    self._text(surface, f"{count} POSTS  ·  ${count * UNITS['BARRICADE']['cost']}", min(start_point[0], end_point[0]) + 8, min(start_point[1], end_point[1]) - 18, AMBER, self.small)
+                    count = max(1, math.ceil(length / 48.0))
+                    self._text(surface, f"{count} WALL SEGMENTS  ·  ${count * UNITS['BARRICADE']['cost']}", min(start_point[0], end_point[0]) + 8, min(start_point[1], end_point[1]) - 18, UNITS["BARRICADE"]["color"], self.small)
                 else:
-                    draw.circle(surface, AMBER, cursor, 7, 2)
-                    draw.line(surface, AMBER, (cursor[0] - 8, cursor[1]), (cursor[0] + 8, cursor[1]), 2)
+                    world_x, world_y = self._world_point(cursor)
+                    normalized_y = max(0.0, min(1.0, world_y / WORLD_H))
+                    left = self._map_point(max(0.0, (world_x - 24) / WORLD_W), normalized_y)
+                    right = self._map_point(min(1.0, (world_x + 24) / WORLD_W), normalized_y)
+                    preview_width = max(4, round(12 * map_rect.w / WORLD_W * self.operation_zoom))
+                    draw.line(surface, (55, 37, 27), left, right, preview_width + 4)
+                    draw.line(surface, UNITS["BARRICADE"]["color"], left, right, preview_width)
             else:
                 if self.target_mode == "deploy":
                     radius_world = UNITS[self.selected_unit]["range"]
@@ -2670,8 +2832,8 @@ class Deadgrid:
                     radius_world = 92
                 else:
                     radius_world = 30
-                radius_x = max(1, round(radius_world * map_rect.w / WORLD_W))
-                radius_y = max(1, round(radius_world * map_rect.h / WORLD_H))
+                radius_x = max(1, round(radius_world * map_rect.w / WORLD_W * self.operation_zoom))
+                radius_y = max(1, round(radius_world * map_rect.h / WORLD_H * self.operation_zoom))
                 draw.ellipse(surface, color, pygame.Rect(cursor[0] - radius_x, cursor[1] - radius_y, radius_x * 2, radius_y * 2), 1)
                 draw.circle(surface, color, cursor, 5, 2)
                 draw.line(surface, color, (cursor[0] - 12, cursor[1]), (cursor[0] + 12, cursor[1]), 1)
@@ -2683,14 +2845,21 @@ class Deadgrid:
         map_rect = self._map_content_rect()
         for mode, enabled in self.intel_modes.items():
             if enabled and mode in self.intel_layers:
-                _scaled_blit(surface, self.intel_layers[mode], map_rect.topleft, source_is_native=True)
+                layer = self.intel_layers[mode]
+                source_rect = pygame.Rect(
+                    round((self.operation_view_center[0] - 0.5 / self.operation_zoom) * layer.get_width()),
+                    round((self.operation_view_center[1] - 0.5 / self.operation_zoom) * layer.get_height()),
+                    max(1, round(layer.get_width() / self.operation_zoom)),
+                    max(1, round(layer.get_height() / self.operation_zoom)),
+                ).clip(layer.get_rect())
+                view = pygame.transform.scale(layer.subsurface(source_rect), layer.get_size())
+                _scaled_blit(surface, view, map_rect.topleft, source_is_native=True)
                 shown.append(labels[mode])
         return shown
 
     def _target_preview(self) -> tuple[float, float]:
-        x, y = self.mouse
-        rect = self._map_content_rect()
-        return (max(0.0, min(1.0, (x - rect.x) / rect.w)), max(0.0, min(1.0, (y - rect.y) / rect.h)))
+        x, y = self._world_point(self.mouse)
+        return (max(0.0, min(1.0, x / WORLD_W)), max(0.0, min(1.0, y / WORLD_H)))
 
     def _draw_operation(self, active: bool) -> None:
         surface = self.canvas
@@ -2733,6 +2902,9 @@ class Deadgrid:
             self._button(surface, "launch", pygame.Rect(36, 690, 204, 48), "BEGIN OPERATION  →", accent=LIME, subtitle="PATIENT ZERO IS ACTIVE")
         # Map and source bar.
         self._draw_map_overlay(surface)
+        self._button(surface, "operation_zoom_in", pygame.Rect(MAP_RECT.right - 48, MAP_RECT.y + 45, 34, 30), "+", accent=CYAN)
+        self._button(surface, "operation_zoom_out", pygame.Rect(MAP_RECT.right - 48, MAP_RECT.y + 81, 34, 30), "−", accent=CYAN)
+        self._text(surface, f"{self.operation_zoom:.1f}×", MAP_RECT.right - 51, MAP_RECT.y + 116, TEXT, self.small)
         draw.rect(surface, PANEL, (MAP_RECT.x, MAP_RECT.bottom, MAP_RECT.w, 27))
         self._text(surface, f"{self.city.name.upper()}   ·   {self.city.source}   ·   © OPENSTREETMAP CONTRIBUTORS / OVERTURE MAPS", MAP_RECT.x + 12, MAP_RECT.bottom + 7, (118, 140, 128), self.small)
         if self.target_mode == "deploy":
@@ -2898,21 +3070,119 @@ class Deadgrid:
         start = self._snap_barricade_anchor(start)
         end = self._snap_barricade_anchor(end)
         length = math.dist(start, end)
-        count = max(1, math.ceil(length / 48.0) + (1 if length >= 18.0 else 0))
-        positions = [
-            (start[0] + (end[0] - start[0]) * index / max(1, count - 1),
-             start[1] + (end[1] - start[1]) * index / max(1, count - 1))
-            for index in range(count)
-        ]
+        if length < 1.0:
+            center_x = max(24.0, min(WORLD_W - 24.0, start[0]))
+            center_y = max(8.0, min(WORLD_H - 8.0, start[1]))
+            start, end = (center_x - 24.0, center_y), (center_x + 24.0, center_y)
+            length = 48.0
+        count = max(1, math.ceil(length / 48.0))
         cost = UNITS["BARRICADE"]["cost"] * count
         if not self._pay(cost):
             return 0
-        for x, y in positions:
-            self.units.append({"kind": "BARRICADE", "x": x, "y": y, "range": 0, "timer": 0.0})
+        for index in range(count):
+            fraction_start = index / count
+            fraction_end = (index + 1) / count
+            wall_start = (
+                start[0] + (end[0] - start[0]) * fraction_start,
+                start[1] + (end[1] - start[1]) * fraction_start,
+            )
+            wall_end = (
+                start[0] + (end[0] - start[0]) * fraction_end,
+                start[1] + (end[1] - start[1]) * fraction_end,
+            )
+            midpoint = ((wall_start[0] + wall_end[0]) / 2, (wall_start[1] + wall_end[1]) / 2)
+            self.units.append({
+                "kind": "BARRICADE",
+                "x": midpoint[0],
+                "y": midpoint[1],
+                "wall_start": wall_start,
+                "wall_end": wall_end,
+                "durability": MAX_BARRICADE_DURABILITY,
+                "range": 0,
+                "timer": 0.0,
+            })
         self.route_refresh = 0.0
         self.evac_route_refresh = 0.0
-        self._notify(f"BARRICADE LINE DEPLOYED · {count} POSTS · ${cost} COMMITTED")
+        self._refresh_barricade_caches()
+        self._notify(f"BARRICADE WALL DEPLOYED · {count} SEGMENTS · ${cost} COMMITTED")
         return count
+
+    def _damage_barricades(self, dt: float) -> None:
+        if dt <= 0 or not len(self.zombies.get("x", ())):
+            return
+        barricades = [unit for unit in self.units if unit["kind"] == "BARRICADE"]
+        if not barricades:
+            return
+
+        zombie_x = self.zombies["x"]
+        zombie_y = self.zombies["y"]
+        count = len(zombie_x)
+        best_score = np.full(count, np.inf, dtype=np.float32)
+        target_segment = np.full(count, -1, dtype=np.int32)
+        attack_range = ZOMBIE_BARRICADE_ATTACK_RANGE
+
+        for segment_index, barricade in enumerate(barricades):
+            start, end = self._barricade_segment(barricade)
+            min_x, max_x = min(start[0], end[0]) - attack_range, max(start[0], end[0]) + attack_range
+            min_y, max_y = min(start[1], end[1]) - attack_range, max(start[1], end[1]) + attack_range
+            nearby = (
+                (zombie_x >= min_x) & (zombie_x <= max_x)
+                & (zombie_y >= min_y) & (zombie_y <= max_y)
+            )
+            indices = np.flatnonzero(nearby)
+            if not len(indices):
+                continue
+
+            segment_x, segment_y = end[0] - start[0], end[1] - start[1]
+            length_squared = segment_x * segment_x + segment_y * segment_y
+            if length_squared <= 0:
+                continue
+            projection = np.clip(
+                ((zombie_x[indices] - start[0]) * segment_x + (zombie_y[indices] - start[1]) * segment_y)
+                / length_squared,
+                0.0,
+                1.0,
+            )
+            nearest_x = start[0] + projection * segment_x
+            nearest_y = start[1] + projection * segment_y
+            distance = np.hypot(zombie_x[indices] - nearest_x, zombie_y[indices] - nearest_y)
+            in_range = distance <= attack_range
+            if not np.any(in_range):
+                continue
+            indices = indices[in_range]
+            distance = distance[in_range]
+            weak_point_bias = (
+                max(0.0, min(1.0, float(barricade.get("durability", MAX_BARRICADE_DURABILITY)) / MAX_BARRICADE_DURABILITY))
+                * 12.0
+            )
+            individual_bias = (
+                (indices * 17 + segment_index * 13 + int(self.simulation_time * 7)) % 19
+            ).astype(np.float32)
+            score = distance * 0.7 + weak_point_bias + individual_bias
+            preferred = score < best_score[indices]
+            chosen = indices[preferred]
+            best_score[chosen] = score[preferred]
+            target_segment[chosen] = segment_index
+
+        attackers = np.bincount(target_segment[target_segment >= 0], minlength=len(barricades))
+        destroyed = False
+        for segment_index, attack_count in enumerate(attackers):
+            if not attack_count:
+                continue
+            barricade = barricades[segment_index]
+            damage_per_second = min(40.0, 8.0 * math.sqrt(int(attack_count)))
+            barricade["durability"] = float(
+                barricade.get("durability", MAX_BARRICADE_DURABILITY)
+            ) - damage_per_second * dt
+            if barricade["durability"] <= 0:
+                if barricade in self.units:
+                    self.units.remove(barricade)
+                destroyed = True
+
+        if destroyed:
+            self.route_refresh = 0.0
+            self.evac_route_refresh = 0.0
+            self._refresh_barricade_caches()
 
     def _finish_barricade_drag(self, point: tuple[int, int]) -> None:
         start = self.barricade_drag_start
@@ -2945,6 +3215,7 @@ class Deadgrid:
         if kind == "BARRICADE":
             self.route_refresh = 0.0
             self.evac_route_refresh = 0.0
+            self._refresh_barricade_caches()
         elif kind == "EVAC STATION":
             if self.emergency_policy == "EVACUATE":
                 self._set_emergency_policy(self.emergency_policy)
@@ -3121,6 +3392,7 @@ class Deadgrid:
             except pygame.error:
                 self.world_tile_failures[key] = time.monotonic() + 60.0
                 continue
+            _darken_world_tile(tile_surface)
             self.world_tile_failures.pop(key, None)
             self.world_tiles[key] = tile_surface
             if len(self.world_tiles) > 120:
@@ -3272,7 +3544,9 @@ class Deadgrid:
                 zombies["y"],
                 direction_x / distance * speed * dt,
                 direction_y / distance * speed * dt,
+                block_barricades=True,
             )
+            self._damage_barricades(dt)
 
             zombie_cell_x = np.clip((zombies["x"] * (grid_w / WORLD_W)).astype(np.int32), 0, grid_w - 1)
             zombie_cell_y = np.clip((zombies["y"] * (grid_h / WORLD_H)).astype(np.int32), 0, grid_h - 1)
@@ -3468,7 +3742,11 @@ class Deadgrid:
                 if key in self.hit_targets and self.hit_targets[key].collidepoint(point):
                     self.selected_scenario_index = scenario_index
         elif self.screen_name in ("deployment", "active"):
-            if self.target_mode and self._map_content_rect().collidepoint(point):
+            if self.hit_targets.get("operation_zoom_in", pygame.Rect(0, 0, 0, 0)).collidepoint(point):
+                self._zoom_operation(1.25, self._map_content_rect().center)
+            elif self.hit_targets.get("operation_zoom_out", pygame.Rect(0, 0, 0, 0)).collidepoint(point):
+                self._zoom_operation(1 / 1.25, self._map_content_rect().center)
+            elif self.target_mode and self._map_content_rect().collidepoint(point):
                 if self.target_mode == "origin" and self.screen_name == "deployment":
                     origin_x, origin_y = self._world_point(point)
                     self.infection_origin = (origin_x / WORLD_W, origin_y / WORLD_H)
@@ -3486,10 +3764,17 @@ class Deadgrid:
                     self.target_mode = None
                     self._notify(f"PATIENT ZERO POSITIONED · {count:,} INITIAL INFECTED")
                 elif self.target_mode == "move" and self.moving_unit in self.units:
-                    self.moving_unit["x"], self.moving_unit["y"] = self._world_point(point)
+                    old_x, old_y = self.moving_unit["x"], self.moving_unit["y"]
+                    new_x, new_y = self._world_point(point)
+                    self.moving_unit["x"], self.moving_unit["y"] = new_x, new_y
                     if self.moving_unit["kind"] == "BARRICADE":
+                        shift_x, shift_y = new_x - old_x, new_y - old_y
+                        wall_start, wall_end = self._barricade_segment(self.moving_unit)
+                        self.moving_unit["wall_start"] = (wall_start[0] + shift_x, wall_start[1] + shift_y)
+                        self.moving_unit["wall_end"] = (wall_end[0] + shift_x, wall_end[1] + shift_y)
                         self.route_refresh = 0.0
                         self.evac_route_refresh = 0.0
+                        self._refresh_barricade_caches()
                     elif self.moving_unit["kind"] == "EVAC STATION":
                         self.moving_unit["route_node"] = int(self._snap_agents_to_roads(np.array([self.moving_unit["x"]]), np.array([self.moving_unit["y"]]))[0])
                         self.civilians["route_node"] = self._snap_agents_to_roads(self.civilians["x"], self.civilians["y"])
@@ -3576,6 +3861,12 @@ class Deadgrid:
             self.alive = False
         elif event.type == pygame.MOUSEMOTION:
             self.mouse = self._screen_position(event)
+            if self.screen_name in ("deployment", "active") and self.operation_pan_drag and getattr(event, "buttons", (False, False))[1]:
+                dx = self.mouse[0] - self.operation_pan_last[0]
+                dy = self.mouse[1] - self.operation_pan_last[1]
+                if dx or dy:
+                    self._pan_operation(dx, dy)
+                    self.operation_pan_last = self.mouse
             if self.screen_name == "menu" and getattr(self, "dragging_radius", False) and getattr(event, "buttons", (False,))[0]:
                 self._set_radius_from_x(self.mouse[0])
             if self.screen_name == "menu" and self.world_pan_drag and any(getattr(event, "buttons", ())):
@@ -3599,6 +3890,10 @@ class Deadgrid:
         elif event.type == pygame.MOUSEBUTTONDOWN:
             point = self._screen_position(event)
             self.mouse = point
+            if event.button == 2 and self.screen_name in ("deployment", "active") and self._map_content_rect().collidepoint(point):
+                self.operation_pan_drag = True
+                self.operation_pan_last = point
+                return
             self._click(point, event.button)
         elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
             self.mouse = self._screen_position(event)
@@ -3609,6 +3904,8 @@ class Deadgrid:
             self.dragging_radius = False
             if self.barricade_drag_start is not None:
                 self._finish_barricade_drag(self.mouse)
+        elif event.type == pygame.MOUSEBUTTONUP and event.button == 2:
+            self.operation_pan_drag = False
         elif event.type == pygame.MOUSEBUTTONUP and event.button == 3:
             self.area_pan_drag = False
             self.world_pan_drag = False
@@ -3618,6 +3915,9 @@ class Deadgrid:
         elif event.type == pygame.MOUSEWHEEL and self.screen_name == "area_select":
             if self._area_content_rect().collidepoint(self.mouse):
                 self._zoom_area(1.2 ** event.y, self.mouse)
+        elif event.type == pygame.MOUSEWHEEL and self.screen_name in ("deployment", "active"):
+            if self._map_content_rect().collidepoint(self.mouse):
+                self._zoom_operation(1.2 ** event.y, self.mouse)
         elif event.type == pygame.KEYDOWN:
             if event.key == pygame.K_F10:
                 self.resolution_1080 = not self.resolution_1080
@@ -3664,6 +3964,10 @@ class Deadgrid:
                 if event.key == pygame.K_ESCAPE:
                     self.target_mode = None
                     self.barricade_drag_start = None
+                elif event.key in (pygame.K_PLUS, pygame.K_EQUALS, pygame.K_KP_PLUS):
+                    self._zoom_operation(1.25, self._map_content_rect().center)
+                elif event.key in (pygame.K_MINUS, pygame.K_KP_MINUS):
+                    self._zoom_operation(1 / 1.25, self._map_content_rect().center)
                 elif event.key == pygame.K_SPACE and self.screen_name == "active":
                     self.phase_time = -1 if self.phase_time >= 0 else 0
                 elif pygame.K_1 <= event.key <= pygame.K_6 and self.screen_name == "deployment":
@@ -3754,6 +4058,13 @@ def self_test() -> None:
     from unittest.mock import Mock, patch
 
     pygame.init()
+    assert MapTileWorker.url_template == "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+    test_tile = pygame.Surface((2, 1))
+    test_tile.set_at((0, 0), (255, 255, 255))
+    test_tile.set_at((1, 0), (0, 0, 0))
+    _darken_world_tile(test_tile)
+    assert test_tile.get_at((0, 0))[:3] == (13, 20, 23)
+    assert test_tile.get_at((1, 0))[:3] == (130, 137, 140)
     city = schematic_map("Test City Blocks", 7)
     city.population = 30_000
     assert len(city.roads) >= 10 and len(city.buildings) >= 20
@@ -3981,6 +4292,37 @@ def self_test() -> None:
     menu_game.worker.results.put(operation_preview)
     menu_game._update(0)
     assert menu_game.screen_name == "deployment" and not menu_game.loading
+    operation_anchor = (MAP_RECT.centerx + 110, MAP_RECT.centery - 80)
+    operation_geo_before = menu_game._world_point(operation_anchor)
+    menu_game._zoom_operation(1.5, operation_anchor)
+    operation_geo_after = menu_game._world_point(operation_anchor)
+    assert np.allclose(operation_geo_before, operation_geo_after, atol=1e-5)
+    assert np.allclose(
+        menu_game._map_point(operation_geo_before[0] / WORLD_W, operation_geo_before[1] / WORLD_H),
+        operation_anchor,
+        atol=1,
+    )
+    menu_game._render()
+    old_operation_zoom = menu_game.operation_zoom
+    menu_game.mouse = MAP_RECT.center
+    menu_game._handle_event(pygame.event.Event(pygame.MOUSEWHEEL, {"y": 1}))
+    assert menu_game.operation_zoom > old_operation_zoom
+    menu_game._render()
+    old_operation_zoom = menu_game.operation_zoom
+    menu_game._click(menu_game.hit_targets["operation_zoom_out"].center, 1)
+    assert menu_game.operation_zoom < old_operation_zoom
+    old_operation_zoom = menu_game.operation_zoom
+    menu_game._handle_event(pygame.event.Event(pygame.KEYDOWN, {"key": pygame.K_PLUS}))
+    assert menu_game.operation_zoom > old_operation_zoom
+    pan_start = MAP_RECT.center
+    old_view_center = menu_game.operation_view_center
+    menu_game._handle_event(pygame.event.Event(pygame.MOUSEBUTTONDOWN, {"pos": pan_start, "button": 2}))
+    menu_game._handle_event(pygame.event.Event(
+        pygame.MOUSEMOTION,
+        {"pos": (pan_start[0] + 40, pan_start[1] + 20), "buttons": (False, True, False)},
+    ))
+    menu_game._handle_event(pygame.event.Event(pygame.MOUSEBUTTONUP, {"pos": pan_start, "button": 2}))
+    assert menu_game.operation_view_center != old_view_center and not menu_game.operation_pan_drag
     menu_game._handle_event(pygame.event.Event(pygame.KEYDOWN, {"key": pygame.K_F10}))
     menu_game._render()
     assert menu_game.canvas.get_size() == menu_game.screen.get_size() == menu_game.windowed_size
@@ -4048,8 +4390,8 @@ def self_test() -> None:
     wall_game._draw_operation(False)
     wall_game._handle_event(pygame.event.Event(pygame.MOUSEBUTTONUP, {"pos": wall_end, "button": 1}))
     wall_posts = [unit for unit in wall_game.units if unit["kind"] == "BARRICADE"]
-    assert len(wall_posts) == 4 and wall_game.budget == 1500 - 4 * UNITS["BARRICADE"]["cost"]
-    assert wall_posts[0]["x"] == 200 and wall_posts[-1]["x"] == 300
+    assert len(wall_posts) == 3 and wall_game.budget == 1500 - 3 * UNITS["BARRICADE"]["cost"]
+    assert wall_posts[0]["wall_start"][0] == 200 and wall_posts[-1]["wall_end"][0] == 300
 
     street_nodes, street_graph, street_edges = _build_road_graph(city)
     crossing = int(np.argmin((street_nodes[:, 0] - 450) ** 2 + (street_nodes[:, 1] - 308) ** 2))
@@ -4251,6 +4593,66 @@ def self_test() -> None:
     barricade_cache_game._refresh_barricade_caches()
     assert barricade_cache_game._penalized_edge_keys != previous_penalized_edges
 
+    barricade_wall_game = Deadgrid()
+    barricade_wall_game._begin_operation(CityMap(
+        "Solid barricade test",
+        population=1000,
+        roads=[[(0.2, 0.5), (0.8, 0.5)]],
+        road_types=["residential"],
+    ))
+    wall_segments = barricade_wall_game._deploy_barricade_line((500.0, 250.0), (500.0, 450.0))
+    assert wall_segments > 0 and barricade_wall_game._barricade_blocked_edge_keys
+    wall = barricade_wall_game.units[0]
+    assert wall["wall_start"] != wall["wall_end"]
+    assert UNITS["BARRICADE"]["color"] == (153, 91, 48)
+    zombie_x = np.array([500.0], dtype=np.float32)
+    zombie_y = np.array([300.0], dtype=np.float32)
+    barricade_wall_game._move_with_collision(zombie_x, zombie_y, np.array([0.0]), np.array([100.0]))
+    assert zombie_y[0] == 400.0
+    zombie_y[0] = 300.0
+    barricade_wall_game._move_with_collision(
+        zombie_x,
+        zombie_y,
+        np.array([0.0]),
+        np.array([100.0]),
+        block_barricades=True,
+    )
+    assert zombie_y[0] < 350.0
+
+    durability_game = Deadgrid()
+    durability_game._begin_operation(CityMap("Barricade durability test", population=1000))
+    weak_wall = {
+        "kind": "BARRICADE",
+        "x": 500.0,
+        "y": 350.0,
+        "wall_start": (476.0, 350.0),
+        "wall_end": (524.0, 350.0),
+        "durability": 120.0,
+    }
+    strong_wall = {
+        "kind": "BARRICADE",
+        "x": 500.0,
+        "y": 360.0,
+        "wall_start": (476.0, 360.0),
+        "wall_end": (524.0, 360.0),
+        "durability": MAX_BARRICADE_DURABILITY,
+    }
+    durability_game.units = [weak_wall, strong_wall]
+    durability_game._refresh_barricade_caches()
+    durability_game.zombies = {
+        "x": np.full(50, 500.0, dtype=np.float32),
+        "y": np.full(50, 355.0, dtype=np.float32),
+    }
+    healthy_color = durability_game._barricade_health_color(strong_wall)
+    durability_game._damage_barricades(1.0)
+    assert weak_wall["durability"] < 120.0
+    assert strong_wall["durability"] < MAX_BARRICADE_DURABILITY
+    assert durability_game._barricade_health_color(strong_wall) != healthy_color
+    durability_game._damage_barricades(8.0)
+    assert not any(unit["kind"] == "BARRICADE" for unit in durability_game.units)
+    assert not durability_game._barricade_blocked_edge_keys
+    assert not durability_game.barricade_blocked_grid.any()
+
     evacuation_game = Deadgrid()
     evacuation_game.represented_population = 1_000
     evacuation_game.zombies = {"x": np.empty(0, dtype=np.float32)}
@@ -4284,7 +4686,7 @@ def self_test() -> None:
     game._click(game.hit_targets["origin"].center, 1)
     assert game.target_mode == "origin"
     game._click(game._map_point(0.25, 1 / 3), 1)
-    assert game.infection_origin == (0.25, 1 / 3) and len(game.zombies["x"]) == round(game.population_agents * 0.05)
+    assert np.allclose(game.infection_origin, (0.25, 1 / 3), atol=1e-5) and len(game.zombies["x"]) == round(game.population_agents * 0.05)
     game.civilians = {
         "x": np.array([250.0], dtype=np.float32),
         "y": np.array([200.0], dtype=np.float32),
