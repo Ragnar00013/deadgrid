@@ -23,6 +23,7 @@ import requests
 WIDTH, HEIGHT = 1360, 820
 WORLD_W, WORLD_H = 1000.0, 700.0
 MAP_RECT = pygame.Rect(276, 118, 796, 636)
+AREA_MAP_RECT = pygame.Rect(40, 112, 1280, 594)
 
 
 def _scenario_path() -> Path:
@@ -91,6 +92,9 @@ class CityMap:
     note: str = ""
     water: list[list[tuple[float, float]]] = field(default_factory=list)
     building_types: list[str] = field(default_factory=list)
+    query_bounds: tuple[float, float, float, float] | None = None
+    place_population: int = 0
+    preview_radius_km: float = 0.0
 
 
 def _normalized(lon: float, lat: float, bounds: tuple[float, float, float, float]) -> tuple[float, float]:
@@ -231,7 +235,7 @@ def _parse_population(value: Any) -> int:
     return max(0, round(count))
 
 
-def load_city(place: str, use_overture: bool = True, radius_km: float = 1.5) -> CityMap:
+def load_city(place: str, use_overture: bool = True, radius_km: float = 1.5, preview_radius_km: float | None = None) -> CityMap:
     """Geocode a place and fetch its street/building geometry from open map data."""
     headers = {"User-Agent": "DeadgridStrategy/1.0 (open map data game)"}
     fallback = schematic_map(place, sum(ord(char) for char in place))
@@ -255,8 +259,9 @@ def load_city(place: str, use_overture: bool = True, radius_km: float = 1.5) -> 
         else:
             place_bounds = (lon - 0.01, lat - 0.01, lon + 0.01, lat + 0.01)
         radius_km = max(0.35, min(2.0, radius_km))
-        radius_lat = radius_km / 110.57
-        radius_lon = min(0.05, radius_lat / max(0.22, math.cos(math.radians(lat))))
+        preview_radius_km = max(radius_km, min(5.0, preview_radius_km or radius_km))
+        radius_lat = preview_radius_km / 110.57
+        radius_lon = min(0.08, radius_lat / max(0.22, math.cos(math.radians(lat))))
         bounds = (lon - radius_lon, lat - radius_lat, lon + radius_lon, lat + radius_lat)
         city_population = _parse_population(match.get("extratags", {}).get("population"))
     except Exception as error:
@@ -273,7 +278,7 @@ def load_city(place: str, use_overture: bool = True, radius_km: float = 1.5) -> 
         f'way["waterway"]({south},{west},{north},{east});'
         ");out geom qt;"
     )
-    city = CityMap(name=display_name, center=(lat, lon), place_bounds=place_bounds, radius_km=radius_km)
+    city = CityMap(name=display_name, center=(lat, lon), place_bounds=place_bounds, radius_km=radius_km, query_bounds=bounds, place_population=city_population, preview_radius_km=preview_radius_km)
     if city_population > 0:
         selected_area_km2 = math.pi * radius_km ** 2
         area_share = min(1.0, selected_area_km2 / _area_km2(place_bounds))
@@ -443,12 +448,12 @@ class MapWorker:
     def __init__(self) -> None:
         self.results: queue.Queue[CityMap] = queue.Queue()
 
-    def request(self, place: str, use_overture: bool, radius_km: float) -> None:
-        thread = threading.Thread(target=self._work, args=(place, use_overture, radius_km), daemon=True)
+    def request(self, place: str, use_overture: bool, radius_km: float, preview_radius_km: float | None = None) -> None:
+        thread = threading.Thread(target=self._work, args=(place, use_overture, radius_km, preview_radius_km), daemon=True)
         thread.start()
 
-    def _work(self, place: str, use_overture: bool, radius_km: float) -> None:
-        self.results.put(load_city(place, use_overture, radius_km))
+    def _work(self, place: str, use_overture: bool, radius_km: float, preview_radius_km: float | None = None) -> None:
+        self.results.put(load_city(place, use_overture, radius_km, preview_radius_km))
 
 
 class Deadgrid:
@@ -485,6 +490,15 @@ class Deadgrid:
         self.zombie_behavior = "BALANCED"
         self.starting_resources = 1500
         self.patient_zero = (0.5, 0.5)
+        self.area_selection = (0.5, 0.5)
+        self.area_zoom = 1.0
+        self.area_view_center = (0.5, 0.5)
+        self.area_pan_drag = False
+        self.area_pan_last = (0, 0)
+        self.fullscreen = False
+        self.resolution_1080 = False
+        self.windowed_size = (WIDTH, HEIGHT)
+        self.city_surface_cache: dict[tuple[Any, ...], pygame.Surface] = {}
         self.emergency_policy = "EVACUATE"
         self.supply_deliveries = 0
         self.infection_casualties = 0
@@ -624,10 +638,171 @@ class Deadgrid:
         self.loading = True
         self.input_active = False
         self._notify("GEOCODING PLACE · FETCHING STREET AND BUILDING DATA", 60.0)
-        self.worker.request(place, self.use_overture, self.radius_km)
+        preview_radius = max(3.5, self.radius_km + 1.5)
+        self.worker.request(place, self.use_overture, self.radius_km, preview_radius)
+
+    def _limit_area_selection(self) -> None:
+        bounds = self.city.query_bounds
+        if not bounds:
+            preview_radius = max(self.city.preview_radius_km, self.radius_km + 1.5, 3.5)
+            margin_y = min(0.49, self.radius_km / (2 * preview_radius))
+            margin_x = min(0.49, margin_y * WORLD_H / WORLD_W)
+            self.area_selection = (
+                max(margin_x, min(1.0 - margin_x, self.area_selection[0])),
+                max(margin_y, min(1.0 - margin_y, self.area_selection[1])),
+            )
+            return
+        west, south, east, north = bounds
+        latitude = north - self.area_selection[1] * (north - south)
+        radius_lat = self.radius_km / 110.57
+        radius_lon = radius_lat / max(0.22, math.cos(math.radians(latitude)))
+        margin_x = min(0.49, radius_lon / (east - west))
+        margin_y = min(0.49, radius_lat / (north - south))
+        self.area_selection = (
+            max(margin_x, min(1.0 - margin_x, self.area_selection[0])),
+            max(margin_y, min(1.0 - margin_y, self.area_selection[1])),
+        )
+
+    def _clip_line(self, points: list[tuple[float, float]]) -> list[list[tuple[float, float]]]:
+        segments: list[list[tuple[float, float]]] = []
+        current: list[tuple[float, float]] = []
+        for start, end in zip(points, points[1:]):
+            x0, y0 = start
+            dx, dy = end[0] - x0, end[1] - y0
+            lower, upper = 0.0, 1.0
+            for p, q in ((-dx, x0), (dx, 1.0 - x0), (-dy, y0), (dy, 1.0 - y0)):
+                if abs(p) < 1e-12:
+                    if q < 0:
+                        lower, upper = 1.0, 0.0
+                        break
+                    continue
+                ratio = q / p
+                if p < 0:
+                    lower = max(lower, ratio)
+                else:
+                    upper = min(upper, ratio)
+            if lower > upper:
+                if len(current) > 1:
+                    segments.append(current)
+                current = []
+                continue
+            clipped_start = (x0 + lower * dx, y0 + lower * dy)
+            clipped_end = (x0 + upper * dx, y0 + upper * dy)
+            if current and math.dist(current[-1], clipped_start) < 1e-6:
+                current.append(clipped_end)
+            else:
+                if len(current) > 1:
+                    segments.append(current)
+                current = [clipped_start, clipped_end]
+        if len(current) > 1:
+            segments.append(current)
+        return segments
+
+    def _clip_polygon(self, points: list[tuple[float, float]]) -> list[tuple[float, float]]:
+        clipped = points
+        for axis, boundary, keep_greater in ((0, 0.0, True), (0, 1.0, False), (1, 0.0, True), (1, 1.0, False)):
+            if not clipped:
+                return []
+            output = []
+            previous = clipped[-1]
+            previous_inside = previous[axis] >= boundary if keep_greater else previous[axis] <= boundary
+            for current in clipped:
+                current_inside = current[axis] >= boundary if keep_greater else current[axis] <= boundary
+                if current_inside != previous_inside:
+                    delta = current[axis] - previous[axis]
+                    fraction = 0.0 if abs(delta) < 1e-12 else (boundary - previous[axis]) / delta
+                    other_axis = 1 - axis
+                    intersection = [0.0, 0.0]
+                    intersection[axis] = boundary
+                    intersection[other_axis] = previous[other_axis] + fraction * (current[other_axis] - previous[other_axis])
+                    output.append((intersection[0], intersection[1]))
+                if current_inside:
+                    output.append(current)
+                previous, previous_inside = current, current_inside
+            clipped = output
+        return clipped
+
+    def _select_city_area(self, city: CityMap, center: tuple[float, float], radius_km: float) -> CityMap:
+        geographic = city.query_bounds is not None
+        if geographic:
+            west, south, east, north = city.query_bounds
+            latitude = north - center[1] * (north - south)
+            longitude = west + center[0] * (east - west)
+            radius_lat = radius_km / 110.57
+            radius_lon = radius_lat / max(0.22, math.cos(math.radians(latitude)))
+            area_bounds = (
+                max(west, longitude - radius_lon),
+                max(south, latitude - radius_lat),
+                min(east, longitude + radius_lon),
+                min(north, latitude + radius_lat),
+            )
+            area_west, area_south, area_east, area_north = area_bounds
+            if area_east <= area_west or area_north <= area_south:
+                return city
+
+            def to_area(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
+                geographic_points = [(west + x * (east - west), north - y * (north - south)) for x, y in points]
+                return [((lon - area_west) / (area_east - area_west), (area_north - lat) / (area_north - area_south)) for lon, lat in geographic_points]
+
+            geographic_center = (latitude, longitude)
+        else:
+            preview_radius = max(city.preview_radius_km, radius_km + 1.5, 3.5)
+            half_y = min(0.49, radius_km / (2 * preview_radius))
+            half_x = min(0.49, half_y * WORLD_H / WORLD_W)
+            area_bounds = (center[0] - half_x, center[1] - half_y, center[0] + half_x, center[1] + half_y)
+            area_west, area_south, area_east, area_north = area_bounds
+            if area_east <= area_west or area_north <= area_south:
+                return city
+
+            def to_area(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
+                return [((x - area_west) / (area_east - area_west), (y - area_south) / (area_north - area_south)) for x, y in points]
+
+            geographic_center = city.center
+
+        def project_and_clip(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
+            return self._clip_polygon(to_area(points))
+
+        selected = CityMap(
+            name=city.name,
+            center=geographic_center,
+            place_bounds=city.place_bounds,
+            radius_km=radius_km,
+            population_source=city.population_source,
+            source=city.source,
+            note=city.note,
+            query_bounds=area_bounds if geographic else None,
+            place_population=city.place_population,
+            preview_radius_km=radius_km,
+        )
+        for index, road in enumerate(city.roads):
+            for segment in self._clip_line(to_area(road)):
+                selected.roads.append(segment)
+                selected.road_types.append(city.road_types[index] if index < len(city.road_types) else "residential")
+        for index, polygon in enumerate(city.buildings):
+            clipped = project_and_clip(polygon)
+            if len(clipped) >= 3:
+                selected.buildings.append(clipped)
+                selected.building_weights.append(city.building_weights[index] if index < len(city.building_weights) else 1.0)
+                selected.building_types.append(city.building_types[index] if index < len(city.building_types) else "residential")
+        for polygons, destination in ((city.parks, selected.parks), (city.water, selected.water)):
+            for polygon in polygons:
+                clipped = project_and_clip(polygon)
+                if len(clipped) >= 3:
+                    destination.append(clipped)
+
+        if geographic and city.place_population and city.place_bounds:
+            area_share = min(1.0, math.pi * radius_km ** 2 / _area_km2(city.place_bounds))
+            selected.population = max(1, round(city.place_population * area_share))
+            selected.population_source = f"OSM POPULATION TAG · {city.place_population:,} PLACE TOTAL · AREA SHARE ESTIMATE"
+        else:
+            selected.population = max(500, len(selected.buildings) * 18)
+            selected.population_source = "BUILDING FOOTPRINT ESTIMATE · NO OSM POPULATION TAG"
+        selected.base_population = selected.population
+        return selected
 
     def _begin_operation(self, city: CityMap) -> None:
         self.city = city
+        self.city_surface_cache.clear()
         self.intel_grids = {key: np.zeros((GRID_H, GRID_W), dtype=np.float32) for key in self.intel_modes}
         self.intel_layers = {}
         self.intel_refresh = 0.0
@@ -1103,13 +1278,27 @@ class Deadgrid:
         pixels[np.minimum(pixels_x + 1, MAP_RECT.right - 1), pixels_y] = color
         del pixels
 
-    def _draw_city(self, surface: pygame.Surface, rect: pygame.Rect, city: CityMap) -> None:
+    def _draw_city(self, surface: pygame.Surface, rect: pygame.Rect, city: CityMap, zoom: float = 1.0, view_center: tuple[float, float] = (0.5, 0.5)) -> None:
+        key = (id(city), rect.w, rect.h, round(zoom, 2), round(view_center[0], 4), round(view_center[1], 4))
+        cached = self.city_surface_cache.get(key)
+        if cached is None:
+            cached = pygame.Surface(rect.size)
+            self._draw_city_uncached(cached, cached.get_rect(), city, zoom, view_center)
+            if len(self.city_surface_cache) >= 8:
+                self.city_surface_cache.pop(next(iter(self.city_surface_cache)))
+            self.city_surface_cache[key] = cached
+        surface.blit(cached, rect.topleft)
+
+    def _draw_city_uncached(self, surface: pygame.Surface, rect: pygame.Rect, city: CityMap, zoom: float = 1.0, view_center: tuple[float, float] = (0.5, 0.5)) -> None:
         pygame.draw.rect(surface, MAP_BASE, rect)
         previous_clip = surface.get_clip()
         surface.set_clip(rect)
 
         def screen_points(points: list[tuple[float, float]]) -> list[tuple[int, int]]:
-            return [(int(rect.x + x * rect.w), int(rect.y + y * rect.h)) for x, y in points]
+            return [
+                (int(rect.centerx + (x - view_center[0]) * rect.w * zoom), int(rect.centery + (y - view_center[1]) * rect.h * zoom))
+                for x, y in points
+            ]
 
         # Terrain, parks, and water sit beneath every built feature.
         for park in city.parks:
@@ -1142,6 +1331,7 @@ class Deadgrid:
         # Streets are painted after footprints so intersections remain legible.
         minor_types = {"residential", "living_street", "service", "unclassified", "footway", "path", "track", "pedestrian", "cycleway"}
         major_types = {"motorway", "motorway_link", "trunk", "trunk_link", "primary", "primary_link", "secondary", "secondary_link", "tertiary", "tertiary_link"}
+        stroke_scale = max(1.0, zoom ** 0.4)
         roads_by_layer: dict[str, list[tuple[list[tuple[int, int]], str]]] = {"minor": [], "major": [], "bridge": []}
         for index, road in enumerate(city.roads):
             points = screen_points(road)
@@ -1166,16 +1356,16 @@ class Deadgrid:
                     offset += dash_length
 
         for points, _ in roads_by_layer["minor"]:
-            pygame.draw.lines(surface, (135, 149, 136), False, points, 5)
-            pygame.draw.lines(surface, (224, 225, 204), False, points, 3)
+            pygame.draw.lines(surface, (135, 149, 136), False, points, max(1, round(5 * stroke_scale)))
+            pygame.draw.lines(surface, (224, 225, 204), False, points, max(1, round(3 * stroke_scale)))
         for points, _ in roads_by_layer["major"]:
-            pygame.draw.lines(surface, (107, 122, 119), False, points, 10)
-            pygame.draw.lines(surface, (211, 210, 185), False, points, 7)
-            draw_markings(points, (169, 151, 108), 13)
+            pygame.draw.lines(surface, (107, 122, 119), False, points, max(2, round(10 * stroke_scale)))
+            pygame.draw.lines(surface, (211, 210, 185), False, points, max(1, round(7 * stroke_scale)))
+            draw_markings(points, (169, 151, 108), 13 * stroke_scale)
         for points, _ in roads_by_layer["bridge"]:
-            pygame.draw.lines(surface, (75, 113, 124), False, points, 12)
-            pygame.draw.lines(surface, (177, 195, 188), False, points, 8)
-            draw_markings(points, (219, 195, 132), 12)
+            pygame.draw.lines(surface, (75, 113, 124), False, points, max(2, round(12 * stroke_scale)))
+            pygame.draw.lines(surface, (177, 195, 188), False, points, max(1, round(8 * stroke_scale)))
+            draw_markings(points, (219, 195, 132), 12 * stroke_scale)
 
         surface.set_clip(previous_clip)
         pygame.draw.rect(surface, LINE, rect, 1)
@@ -1259,6 +1449,8 @@ class Deadgrid:
         self._text(surface, "DEADGRID", 36, 16, TEXT, self.bold)
         self._text(surface, "CITY CONTAINMENT  /  FIELD COMMAND", 36, 38, MUTED, self.small)
         self._text(surface, mode, 600, 27, LIME, self.small)
+        if not mode.startswith("LIVE SIMULATION"):
+            self._text(surface, "F10 1080P  ·  F11 FULLSCREEN", 1055, 49, MUTED, self.small)
         if mode.startswith("LIVE SIMULATION"):
             self._text(surface, f"T+ {int(self.simulation_time // 60):02}:{int(self.simulation_time % 60):02}", 1010, 27, AMBER, self.bold)
             self._button(surface, "stop_simulation", pygame.Rect(1203, 16, 132, 45), "STOP SIMULATION", accent=RED)
@@ -1312,9 +1504,62 @@ class Deadgrid:
             self._text(surface, "Geocoding place · loading streets and building footprints…", 52, 709, MUTED, self.small)
             pygame.draw.rect(surface, LIME, (36, 729, 615, 2))
         else:
-            self._button(surface, "build_plan", pygame.Rect(36, 676, 615, 57), "BUILD RESPONSE PLAN  →", accent=LIME, subtitle="REAL PLACE DATA  /  DEPLOYMENT PHASE")
-            self._button(surface, "config", pygame.Rect(359, 676, 292, 57), "WORLD SETTINGS  /  SCENARIOS", accent=CYAN, subtitle="DENSITY · BEHAVIOR · STARTING FUNDS")
+            self._button(surface, "build_plan", pygame.Rect(36, 676, 300, 57), "BUILD RESPONSE PLAN  →", accent=LIME, subtitle="REVIEW MAP · DEPLOY")
+            self._button(surface, "config", pygame.Rect(346, 676, 305, 57), "WORLD SETTINGS", accent=CYAN, subtitle="TUNE & SAVE SCENARIOS")
         self._text(surface, self.message if self.message_timer > 0 else f"SAVED SCENARIOS  {len(self.saved_scenarios)}  ·  STARTING INFECTION  {self.initial_infection_percent:g}%", 36, 779, MUTED, self.small)
+
+    def _draw_area_select(self) -> None:
+        surface = self.canvas
+        surface.fill(INK)
+        self.hit_targets = {}
+        self._header(surface, "SELECT OPERATION AREA")
+        self._text(surface, self.city.name.upper(), 40, 88, TEXT, self.bold)
+        self._text(surface, "CLICK TO CENTER  ·  RIGHT-DRAG TO PAN  ·  WHEEL OR +/- TO ZOOM", 365, 91, MUTED, self.small)
+        self._draw_city(surface, AREA_MAP_RECT, self.city, self.area_zoom, self.area_view_center)
+        center_point = (
+            int(AREA_MAP_RECT.centerx + (self.area_selection[0] - self.area_view_center[0]) * AREA_MAP_RECT.w * self.area_zoom),
+            int(AREA_MAP_RECT.centery + (self.area_selection[1] - self.area_view_center[1]) * AREA_MAP_RECT.h * self.area_zoom),
+        )
+        bounds = self.city.query_bounds
+        if bounds:
+            west, south, east, north = bounds
+            latitude = north - self.area_selection[1] * (north - south)
+            radius_lat = self.radius_km / 110.57
+            radius_lon = radius_lat / max(0.22, math.cos(math.radians(latitude)))
+            radius_x = max(2, round(radius_lon / (east - west) * AREA_MAP_RECT.w * self.area_zoom))
+            radius_y = max(2, round(radius_lat / (north - south) * AREA_MAP_RECT.h * self.area_zoom))
+        else:
+            preview_radius = max(self.city.preview_radius_km, self.radius_km + 1.5, 3.5)
+            radius_y = max(2, round(self.radius_km / (2 * preview_radius) * AREA_MAP_RECT.h * self.area_zoom))
+            radius_x = max(2, round(self.radius_km / (2 * preview_radius) * WORLD_H / WORLD_W * AREA_MAP_RECT.w * self.area_zoom))
+        area_rect = pygame.Rect(center_point[0] - radius_x, center_point[1] - radius_y, radius_x * 2, radius_y * 2)
+        shade = pygame.Surface(AREA_MAP_RECT.size, pygame.SRCALPHA)
+        shade.fill((8, 15, 13, 104))
+        pygame.draw.ellipse(shade, (0, 0, 0, 0), area_rect.move(-AREA_MAP_RECT.x, -AREA_MAP_RECT.y))
+        surface.blit(shade, AREA_MAP_RECT.topleft)
+        previous_clip = surface.get_clip()
+        surface.set_clip(AREA_MAP_RECT)
+        pygame.draw.ellipse(surface, (20, 28, 25), area_rect, 9)
+        pygame.draw.ellipse(surface, LIME, area_rect, 3)
+        pygame.draw.circle(surface, RED, center_point, 7)
+        pygame.draw.line(surface, RED, (center_point[0] - 16, center_point[1]), (center_point[0] + 16, center_point[1]), 2)
+        pygame.draw.line(surface, RED, (center_point[0], center_point[1] - 16), (center_point[0], center_point[1] + 16), 2)
+        surface.set_clip(previous_clip)
+        pygame.draw.rect(surface, PANEL, (40, 718, 1280, 72), border_radius=4)
+        self._text(surface, f"AREA RADIUS  {self.radius_km:.2f} KM", 58, 730, CYAN, self.small)
+        radius_slider = pygame.Rect(58, 755, 435, 14)
+        self.hit_targets["area_radius_slider"] = radius_slider
+        pygame.draw.rect(surface, LINE, (radius_slider.x, radius_slider.y + 5, radius_slider.w, 4), border_radius=2)
+        ratio = (self.radius_km - 0.35) / (2.0 - 0.35)
+        pygame.draw.rect(surface, LIME, (radius_slider.x, radius_slider.y + 5, int(radius_slider.w * ratio), 4), border_radius=2)
+        pygame.draw.circle(surface, TEXT, (int(radius_slider.x + radius_slider.w * ratio), radius_slider.centery), 7)
+        self._text(surface, f"{math.pi * self.radius_km ** 2:.1f} KM²  /  SELECTED FOOTPRINT", 520, 738, TEXT, self.small)
+        self._button(surface, "zoom_out", pygame.Rect(770, 730, 44, 42), "−", accent=CYAN)
+        self._text(surface, f"{self.area_zoom:.1f}×", 824, 744, TEXT, self.bold)
+        self._button(surface, "zoom_in", pygame.Rect(867, 730, 44, 42), "+", accent=CYAN)
+        self._button(surface, "area_back", pygame.Rect(1000, 730, 132, 46), "BACK", accent=AMBER)
+        self._button(surface, "area_confirm", pygame.Rect(1142, 730, 160, 46), "USE THIS AREA", accent=LIME)
+        self._text(surface, f"{self.city.source}  ·  {len(self.city.roads):,} STREETS  ·  {len(self.city.buildings):,} BUILDINGS", 58, 779, MUTED, self.small)
 
     def _draw_config(self) -> None:
         surface = self.canvas
@@ -1858,7 +2103,14 @@ class Deadgrid:
             try:
                 city = self.worker.results.get_nowait()
                 self.loading = False
-                self._begin_operation(city)
+                self.city = city
+                self.city_surface_cache.clear()
+                self.screen_name = "area_select"
+                self.area_selection = (0.5, 0.5)
+                self.area_view_center = (0.5, 0.5)
+                self.area_zoom = 1.0
+                self._limit_area_selection()
+                self._notify("MAP READY · CLICK THE CENTER OF YOUR OPERATION AREA", 6.0)
             except queue.Empty:
                 pass
         if self.screen_name != "active" or self.phase_time < 0:
@@ -2069,12 +2321,36 @@ class Deadgrid:
 
     def _click(self, point: tuple[int, int], button: int) -> None:
         if button == 3:
+            if self.screen_name == "area_select":
+                self.area_pan_drag = True
+                self.area_pan_last = point
+                return
             self.target_mode = None
             self.barricade_drag_start = None
             return
         if button != 1:
             return
-        if self.screen_name == "menu":
+        if self.screen_name == "area_select":
+            if self.hit_targets.get("area_radius_slider", pygame.Rect(0, 0, 0, 0)).collidepoint(point):
+                self.dragging_radius = True
+                self._set_area_radius_from_x(point[0])
+            elif self.hit_targets.get("zoom_in", pygame.Rect(0, 0, 0, 0)).collidepoint(point):
+                self.area_zoom = min(4.0, self.area_zoom * 1.25)
+            elif self.hit_targets.get("zoom_out", pygame.Rect(0, 0, 0, 0)).collidepoint(point):
+                self.area_zoom = max(1.0, self.area_zoom / 1.25)
+            elif self.hit_targets.get("area_back", pygame.Rect(0, 0, 0, 0)).collidepoint(point):
+                self.screen_name = "menu"
+                self.city = self.preview_map
+            elif self.hit_targets.get("area_confirm", pygame.Rect(0, 0, 0, 0)).collidepoint(point):
+                selected_city = self._select_city_area(self.city, self.area_selection, self.radius_km)
+                self._begin_operation(selected_city)
+            elif AREA_MAP_RECT.collidepoint(point):
+                self.area_selection = (
+                    self.area_view_center[0] + (point[0] - AREA_MAP_RECT.centerx) / (AREA_MAP_RECT.w * self.area_zoom),
+                    self.area_view_center[1] + (point[1] - AREA_MAP_RECT.centery) / (AREA_MAP_RECT.h * self.area_zoom),
+                )
+                self._limit_area_selection()
+        elif self.screen_name == "menu":
             if self.hit_targets.get("place_input", pygame.Rect(0, 0, 0, 0)).collidepoint(point):
                 self.input_active = True
             elif self.hit_targets.get("radius_slider", pygame.Rect(0, 0, 0, 0)).collidepoint(point):
@@ -2235,6 +2511,16 @@ class Deadgrid:
             self.mouse = self._screen_position(event)
             if self.screen_name == "menu" and getattr(self, "dragging_radius", False) and getattr(event, "buttons", (False,))[0]:
                 self._set_radius_from_x(self.mouse[0])
+            elif self.screen_name == "area_select" and self.dragging_radius and getattr(event, "buttons", (False,))[0]:
+                self._set_area_radius_from_x(self.mouse[0])
+            if self.screen_name == "area_select" and self.area_pan_drag and getattr(event, "buttons", (False, False, False))[2]:
+                dx = self.mouse[0] - self.area_pan_last[0]
+                dy = self.mouse[1] - self.area_pan_last[1]
+                self.area_view_center = (
+                    max(0.5 / self.area_zoom, min(1.0 - 0.5 / self.area_zoom, self.area_view_center[0] - dx / (AREA_MAP_RECT.w * self.area_zoom))),
+                    max(0.5 / self.area_zoom, min(1.0 - 0.5 / self.area_zoom, self.area_view_center[1] - dy / (AREA_MAP_RECT.h * self.area_zoom))),
+                )
+                self.area_pan_last = self.mouse
         elif event.type == pygame.MOUSEBUTTONDOWN:
             point = self._screen_position(event)
             self.mouse = point
@@ -2244,7 +2530,27 @@ class Deadgrid:
             self.dragging_radius = False
             if self.barricade_drag_start is not None:
                 self._finish_barricade_drag(self.mouse)
+        elif event.type == pygame.MOUSEBUTTONUP and event.button == 3:
+            self.area_pan_drag = False
+        elif event.type == pygame.MOUSEWHEEL and self.screen_name == "area_select":
+            if AREA_MAP_RECT.collidepoint(self.mouse):
+                self._zoom_area(1.2 ** event.y, self.mouse)
         elif event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_F10:
+                self.resolution_1080 = not self.resolution_1080
+                if not self.fullscreen:
+                    size = (1920, 1080) if self.resolution_1080 else self.windowed_size
+                    self.screen = pygame.display.set_mode(size, pygame.RESIZABLE)
+                return
+            if event.key == pygame.K_F11:
+                if self.fullscreen:
+                    size = (1920, 1080) if self.resolution_1080 else self.windowed_size
+                    self.screen = pygame.display.set_mode(size, pygame.RESIZABLE)
+                else:
+                    self.windowed_size = self.screen.get_size()
+                    self.screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+                self.fullscreen = not self.fullscreen
+                return
             if self.screen_name == "config" and self.scenario_name_active:
                 if event.key == pygame.K_RETURN:
                     self.scenario_name_active = False
@@ -2259,6 +2565,14 @@ class Deadgrid:
                     self.place_input = self.place_input[:-1]
                 elif event.unicode and event.unicode.isprintable() and len(self.place_input) < 90:
                     self.place_input += event.unicode
+            elif self.screen_name == "area_select":
+                if event.key == pygame.K_ESCAPE:
+                    self.screen_name = "menu"
+                    self.city = self.preview_map
+                elif event.key in (pygame.K_PLUS, pygame.K_EQUALS, pygame.K_KP_PLUS):
+                    self._zoom_area(1.2, AREA_MAP_RECT.center)
+                elif event.key in (pygame.K_MINUS, pygame.K_KP_MINUS):
+                    self._zoom_area(1 / 1.2, AREA_MAP_RECT.center)
             elif self.screen_name in ("deployment", "active"):
                 if event.key == pygame.K_ESCAPE:
                     self.target_mode = None
@@ -2273,6 +2587,19 @@ class Deadgrid:
                     self.intel_modes[mode] = not self.intel_modes[mode]
                     self._refresh_intelligence(self.intel_grids)
 
+    def _zoom_area(self, factor: float, anchor: tuple[int, int]) -> None:
+        old_zoom = self.area_zoom
+        offset_x = (anchor[0] - AREA_MAP_RECT.centerx) / AREA_MAP_RECT.w
+        offset_y = (anchor[1] - AREA_MAP_RECT.centery) / AREA_MAP_RECT.h
+        anchor_x = self.area_view_center[0] + offset_x / old_zoom
+        anchor_y = self.area_view_center[1] + offset_y / old_zoom
+        self.area_zoom = max(1.0, min(4.0, old_zoom * factor))
+        if self.area_zoom != old_zoom:
+            self.area_view_center = (
+                max(0.5 / self.area_zoom, min(1.0 - 0.5 / self.area_zoom, anchor_x - offset_x / self.area_zoom)),
+                max(0.5 / self.area_zoom, min(1.0 - 0.5 / self.area_zoom, anchor_y - offset_y / self.area_zoom)),
+            )
+
     def _set_radius_from_x(self, x: int) -> None:
         slider = self.hit_targets.get("radius_slider")
         if not slider:
@@ -2280,10 +2607,20 @@ class Deadgrid:
         fraction = max(0.0, min(1.0, (x - slider.x) / slider.w))
         self.radius_km = 0.35 + fraction * (2.0 - 0.35)
 
+    def _set_area_radius_from_x(self, x: int) -> None:
+        slider = self.hit_targets.get("area_radius_slider")
+        if not slider:
+            return
+        fraction = max(0.0, min(1.0, (x - slider.x) / slider.w))
+        self.radius_km = 0.35 + fraction * (2.0 - 0.35)
+        self._limit_area_selection()
+
     def _render(self) -> None:
         self.hit_targets = {}
         if self.screen_name == "menu":
             self._draw_menu()
+        elif self.screen_name == "area_select":
+            self._draw_area_select()
         elif self.screen_name == "config":
             self._draw_config()
         elif self.screen_name == "deployment":
@@ -2296,7 +2633,7 @@ class Deadgrid:
         scale = min(width / WIDTH, height / HEIGHT)
         target_w, target_h = int(WIDTH * scale), int(HEIGHT * scale)
         self.screen.fill((5, 9, 10))
-        frame = pygame.transform.smoothscale(self.canvas, (target_w, target_h))
+        frame = pygame.transform.scale(self.canvas, (target_w, target_h))
         self.screen.blit(frame, ((width - target_w) // 2, (height - target_h) // 2))
         pygame.display.flip()
 
@@ -2339,6 +2676,60 @@ def self_test() -> None:
     layer_test.intel_modes = {mode: True for mode in ("risk", "horde", "exposed", "survivors")}
     layer_test.intel_layers = {mode: pygame.Surface(MAP_RECT.size, pygame.SRCALPHA) for mode in layer_test.intel_modes}
     assert len(layer_test._draw_intelligence(layer_surface)) == 4
+
+    crop_game = Deadgrid()
+    geo_preview = CityMap(
+        "Geographic crop test",
+        roads=[[(0.0, 0.5), (1.0, 0.5)]],
+        road_types=["primary"],
+        buildings=[[(0.46, 0.46), (0.54, 0.46), (0.54, 0.54), (0.46, 0.54)]],
+        building_weights=[4.0],
+        building_types=["civic"],
+        query_bounds=(-0.05, -0.05, 0.05, 0.05),
+        place_bounds=(-0.1, -0.1, 0.1, 0.1),
+        place_population=100_000,
+        preview_radius_km=5.5,
+    )
+    cropped_geo = crop_game._select_city_area(geo_preview, (0.5, 0.5), 1.0)
+    assert len(cropped_geo.roads) == 1 and cropped_geo.roads[0][0][0] == 0.0 and cropped_geo.roads[0][-1][0] == 1.0
+    assert len(cropped_geo.buildings) == 1 and cropped_geo.center == (0.0, 0.0)
+    assert cropped_geo.population > 0 and all(0 <= x <= 1 and 0 <= y <= 1 for x, y in cropped_geo.buildings[0])
+
+    offline_preview = schematic_map("Offline area selection test", 5)
+    offline_preview.preview_radius_km = 4.0
+    offline_crop = crop_game._select_city_area(offline_preview, (0.5, 0.5), 1.0)
+    assert offline_crop.roads and offline_crop.buildings
+    assert all(0 <= x <= 1 and 0 <= y <= 1 for road in offline_crop.roads for x, y in road)
+
+    menu_game = Deadgrid()
+    menu_game._render()
+    assert not menu_game.hit_targets["build_plan"].colliderect(menu_game.hit_targets["config"])
+
+    selection_game = Deadgrid()
+    selection_game.worker.results.put(offline_preview)
+    selection_game.loading = True
+    selection_game._update(0)
+    assert selection_game.screen_name == "area_select"
+    selection_game._render()
+    radius_slider = selection_game.hit_targets["area_radius_slider"]
+    selection_game._click((radius_slider.x, radius_slider.centery), 1)
+    assert math.isclose(selection_game.radius_km, 0.35)
+    selection_game._click((radius_slider.right - 1, radius_slider.centery), 1)
+    assert selection_game.radius_km > 1.99
+    selection_game._click((AREA_MAP_RECT.centerx + 80, AREA_MAP_RECT.centery), 1)
+    selection_game._render()
+    selection_game.mouse = (AREA_MAP_RECT.centerx + 180, AREA_MAP_RECT.centery + 90)
+    zoom_offset = ((selection_game.mouse[0] - AREA_MAP_RECT.centerx) / AREA_MAP_RECT.w, (selection_game.mouse[1] - AREA_MAP_RECT.centery) / AREA_MAP_RECT.h)
+    map_anchor_before = (selection_game.area_view_center[0] + zoom_offset[0] / selection_game.area_zoom, selection_game.area_view_center[1] + zoom_offset[1] / selection_game.area_zoom)
+    selection_game._handle_event(pygame.event.Event(pygame.MOUSEWHEEL, {"x": 0, "y": 1}))
+    map_anchor_after = (selection_game.area_view_center[0] + zoom_offset[0] / selection_game.area_zoom, selection_game.area_view_center[1] + zoom_offset[1] / selection_game.area_zoom)
+    assert selection_game.area_zoom > 1 and np.allclose(map_anchor_before, map_anchor_after)
+    keyboard_zoom = selection_game.area_zoom
+    selection_game._handle_event(pygame.event.Event(pygame.KEYDOWN, {"key": pygame.K_PLUS, "unicode": "+"}))
+    assert selection_game.area_zoom > keyboard_zoom
+    selection_game._render()
+    selection_game._click(selection_game.hit_targets["area_confirm"].center, 1)
+    assert selection_game.screen_name == "deployment"
 
     preview_game = Deadgrid()
     preview_game._begin_operation(CityMap("Placement preview test", population=1000))

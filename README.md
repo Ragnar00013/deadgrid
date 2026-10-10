@@ -21,8 +21,10 @@ Install dependencies and build on the same operating system you want to run:
 bash build_linux.sh
 ```
 
-If your default Python was built without a shared library, select one that has
-one with `PYTHON_BIN=/usr/bin/python3.12 bash build_linux.sh`.
+If your default Python was built without a shared library, the Linux build script
+now auto-detects a compatible system Python such as `/usr/bin/python3.12` and
+falls back to `PYTHON_BIN=/path/to/python3.12 bash build_linux.sh` when you want
+an explicit override.
 
 The Linux executable is written to `dist/linux/DEADGRID`. On Windows, run
 `build_windows.bat`; it creates `dist\windows\DEADGRID.exe`. PyInstaller does
@@ -50,7 +52,8 @@ Zombies route through connected street waypoints and intersections toward popula
 ## Field controls
 
 - During deployment, click an asset on the right and click the map to place it. Keys `1`–`6` select the original ground assets.
-- In the briefing, search for a place and set its radius. **World Settings** configures density, behavior, resources, auto-collapse, and named scenario saves.
+- In the briefing, search for a place to open its area-selection map. Click to position the operation, set its radius, use the mouse wheel or `+`/`−` to zoom, right-drag to pan, then choose **Use This Area**. Only the selected area is converted into the deployed map.
+- Press `F10` to toggle a 1080p window and `F11` to toggle fullscreen. **World Settings** configures density, behavior, resources, auto-collapse, and named scenario saves.
 - During deployment, use **Set Outbreak Origin** to place Patient Zero.
 - Start the simulation; it continues until you stop it or optional collapse detection triggers when at most 2% of residents remain.
 - Click **Stop Simulation** to open the analysis view. Restart the same scenario or return to parameters; a contained outbreak remains live until you choose.
