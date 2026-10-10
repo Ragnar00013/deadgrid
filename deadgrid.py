@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import heapq
+import io
 import math
 import os
 import queue
@@ -11,6 +12,8 @@ import random
 import sys
 import threading
 import time
+import weakref
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -25,6 +28,104 @@ NATIVE_WIDTH, NATIVE_HEIGHT = 1920, 1080
 WORLD_W, WORLD_H = 1000.0, 700.0
 MAP_RECT = pygame.Rect(276, 118, 796, 636)
 AREA_MAP_RECT = pygame.Rect(220, 112, 920, 594)
+WORLD_MAP_RECT = pygame.Rect(352, 0, WIDTH - 352, HEIGHT)
+WORLD_TILE_SIZE = 256
+MIN_WORLD_ZOOM, MAX_WORLD_ZOOM = 2, 18
+_SURFACE_TRANSFORMS: weakref.WeakKeyDictionary[pygame.Surface, tuple[float, float, float, float]] = weakref.WeakKeyDictionary()
+
+
+def _surface_transform(surface: pygame.Surface) -> tuple[float, float, float, float] | None:
+    return _SURFACE_TRANSFORMS.get(surface)
+
+
+def _scaled_point(point: tuple[float, float], transform: tuple[float, float, float, float]) -> tuple[int, int]:
+    scale_x, scale_y, offset_x, offset_y = transform
+    return round(point[0] * scale_x + offset_x), round(point[1] * scale_y + offset_y)
+
+
+def _scaled_rect(rect: pygame.Rect | tuple[int, int, int, int], transform: tuple[float, float, float, float]) -> pygame.Rect:
+    scale_x, scale_y, offset_x, offset_y = transform
+    x, y, width, height = rect
+    return pygame.Rect(
+        round(x * scale_x + offset_x),
+        round(y * scale_y + offset_y),
+        max(1, round(width * scale_x)),
+        max(1, round(height * scale_y)),
+    )
+
+
+class _ScaledDraw:
+    def __init__(self, pygame_draw: Any) -> None:
+        self._pygame_draw = pygame_draw
+
+    def __getattr__(self, name: str) -> Any:
+        method = getattr(self._pygame_draw, name)
+        if name not in {"rect", "line", "lines", "polygon", "circle", "ellipse"}:
+            return method
+
+        def draw_method(surface: pygame.Surface, *args: Any, **kwargs: Any) -> Any:
+            transform = _surface_transform(surface)
+            if transform is None:
+                return method(surface, *args, **kwargs)
+            scale_x, scale_y, _, _ = transform
+            scale = (scale_x + scale_y) / 2
+            values = list(args)
+            if name in {"rect", "ellipse"}:
+                values[1] = _scaled_rect(values[1], transform)
+                width_index = 2
+            elif name == "line":
+                values[1] = _scaled_point(values[1], transform)
+                values[2] = _scaled_point(values[2], transform)
+                width_index = 3
+            elif name == "lines":
+                values[2] = [_scaled_point(point, transform) for point in values[2]]
+                width_index = 3
+            elif name == "polygon":
+                values[1] = [_scaled_point(point, transform) for point in values[1]]
+                width_index = 2
+            else:
+                values[1] = _scaled_point(values[1], transform)
+                values[2] = max(1, round(values[2] * scale))
+                width_index = 3
+            if len(values) > width_index:
+                values[width_index] = round(values[width_index] * scale)
+            for key in ("border_radius", "border_top_left_radius", "border_top_right_radius", "border_bottom_left_radius", "border_bottom_right_radius"):
+                if key in kwargs:
+                    kwargs[key] = round(kwargs[key] * scale)
+            return method(surface, *values, **kwargs)
+
+        return draw_method
+
+
+draw = _ScaledDraw(pygame.draw)
+
+
+def _scaled_blit(
+    surface: pygame.Surface,
+    source: pygame.Surface,
+    destination: tuple[int, int] | pygame.Rect,
+    *,
+    source_is_native: bool = False,
+) -> pygame.Rect:
+    transform = _surface_transform(surface)
+    if transform is None:
+        return surface.blit(source, destination)
+    if isinstance(destination, pygame.Rect):
+        target_rect = _scaled_rect(destination, transform)
+        target_size = target_rect.size
+    else:
+        target_rect = _scaled_point(destination, transform)
+        scale_x, scale_y, _, _ = transform
+        target_size = max(1, round(source.get_width() * scale_x)), max(1, round(source.get_height() * scale_y))
+    rendered_source = source
+    if not source_is_native and source.get_size() != target_size:
+        rendered_source = pygame.transform.smoothscale(source, target_size)
+    return surface.blit(rendered_source, target_rect)
+
+
+def _set_scaled_clip(surface: pygame.Surface, rect: pygame.Rect) -> pygame.Rect:
+    transform = _surface_transform(surface)
+    return surface.set_clip(_scaled_rect(rect, transform) if transform else rect)
 
 
 def _scenario_path() -> Path:
@@ -56,10 +157,15 @@ LIME = (186, 234, 112)
 CYAN = (103, 204, 185)
 AMBER = (232, 173, 96)
 RED = (233, 103, 94)
-MAP_BASE = (188, 201, 178)
-MAP_ROAD = (234, 234, 218)
-MAP_BUILDING = (143, 158, 145)
+MAP_BASE = (31, 39, 39)
+MAP_ROAD = (5, 8, 9)
+MAP_BUILDING = (111, 126, 122)
+MAP_BUILDING_EDGE = (77, 91, 89)
+MAP_WATER = (11, 31, 39)
+MAP_PARK = (28, 48, 39)
 GRID_W, GRID_H = 60, 42
+COLLISION_GRID_W, COLLISION_GRID_H = GRID_W * 4, GRID_H * 4
+COLLISION_STEP = 2.0
 
 UNITS = {
     "SNIPER": {"cost": 220, "range": 205, "damage": 27, "rate": 1.05, "color": (105, 193, 178), "description": "LONG RANGE / HIGH DAMAGE"},
@@ -97,10 +203,78 @@ class CityMap:
     note: str = ""
     water: list[list[tuple[float, float]]] = field(default_factory=list)
     waterways: list[list[tuple[float, float]]] = field(default_factory=list)
+    waterway_blocked: list[bool] = field(default_factory=list)
+    waterway_widths_m: list[float] = field(default_factory=list)
     building_types: list[str] = field(default_factory=list)
     query_bounds: tuple[float, float, float, float] | None = None
     place_population: int = 0
     preview_radius_km: float = 0.0
+
+
+@dataclass(frozen=True)
+class PlaceSearchResult:
+    name: str
+    latitude: float
+    longitude: float
+    bounds: tuple[float, float, float, float] | None = None
+    population: int = 0
+
+
+def _tile_xy(latitude: float, longitude: float, zoom: int) -> tuple[float, float]:
+    latitude = max(-85.05112878, min(85.05112878, latitude))
+    count = 1 << zoom
+    x = (longitude + 180.0) / 360.0 * count
+    latitude_radians = math.radians(latitude)
+    y = (1.0 - math.asinh(math.tan(latitude_radians)) / math.pi) * 0.5 * count
+    return x, max(0.0, min(float(count), y))
+
+
+def _latlon_from_tile(x: float, y: float, zoom: int) -> tuple[float, float]:
+    count = 1 << zoom
+    longitude = (x / count) * 360.0 - 180.0
+    latitude = math.degrees(math.atan(math.sinh(math.pi * (1.0 - 2.0 * y / count))))
+    return latitude, longitude
+
+
+def _tile_cache_root() -> Path:
+    if sys.platform == "win32":
+        root = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+    elif sys.platform == "darwin":
+        root = Path.home() / "Library" / "Caches"
+    else:
+        root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+    return root / "Deadgrid" / "map_tiles"
+
+
+def search_places(place: str) -> list[PlaceSearchResult]:
+    headers = {"User-Agent": "DeadgridStrategy/1.0 (open map data game)"}
+    response = requests.get(
+        "https://nominatim.openstreetmap.org/search",
+        params={"q": place, "format": "jsonv2", "limit": 5, "extratags": 1},
+        headers=headers,
+        timeout=14,
+    )
+    response.raise_for_status()
+    matches = response.json()
+    if not isinstance(matches, list) or any(not isinstance(match, dict) for match in matches):
+        raise ValueError("Place service returned an invalid search response.")
+    results = []
+    for match in matches:
+        raw_bounds = match.get("boundingbox")
+        bounds = None
+        if raw_bounds and len(raw_bounds) == 4:
+            bounds = (float(raw_bounds[2]), float(raw_bounds[0]), float(raw_bounds[3]), float(raw_bounds[1]))
+        extratags = match.get("extratags") or {}
+        if not isinstance(extratags, dict):
+            raise ValueError("Place service returned invalid population metadata.")
+        results.append(PlaceSearchResult(
+            name=str(match.get("display_name") or match.get("name") or place),
+            latitude=float(match["lat"]),
+            longitude=float(match["lon"]),
+            bounds=bounds,
+            population=_parse_population(extratags.get("population")),
+        ))
+    return results
 
 
 def _normalized(lon: float, lat: float, bounds: tuple[float, float, float, float]) -> tuple[float, float]:
@@ -302,35 +476,77 @@ def _road_width_m(tags: dict[str, Any]) -> float:
     return min(60.0, max(defaults.get(highway, 5.0), lanes * lane_width))
 
 
-def load_city(place: str, use_overture: bool = True, radius_km: float = 1.5, preview_radius_km: float | None = None) -> CityMap:
-    """Geocode a place and fetch its street/building geometry from open map data."""
+def _waterway_width_m(tags: dict[str, Any]) -> float:
+    try:
+        width = float(str(tags.get("width", "")).lower().replace("m", "").strip())
+    except ValueError:
+        width = 0.0
+    if width > 0:
+        return min(500.0, width)
+    return {
+        "river": 35.0,
+        "riverbank": 35.0,
+        "canal": 16.0,
+        "ditch": 3.0,
+        "drain": 2.0,
+        "stream": 2.5,
+        "brook": 2.5,
+    }.get(str(tags.get("waterway", "")).lower(), 35.0 if tags.get("natural") == "coastline" else 12.0)
+
+
+def _waterway_is_blocked(tags: dict[str, Any], width_m: float) -> bool:
+    kind = str(tags.get("waterway", "")).lower()
+    if tags.get("natural") == "coastline" or kind == "riverbank":
+        return True
+    if kind in {"stream", "brook", "ditch", "drain"}:
+        return False
+    return width_m > 8.0
+
+
+def load_city(
+    place: str,
+    use_overture: bool = True,
+    radius_km: float = 1.5,
+    preview_radius_km: float | None = None,
+    *,
+    center: tuple[float, float] | None = None,
+    place_bounds: tuple[float, float, float, float] | None = None,
+    place_population: int = 0,
+) -> CityMap:
+    """Resolve a place or coordinate and fetch its street/building geometry."""
     headers = {"User-Agent": "DeadgridStrategy/1.0 (open map data game)"}
     fallback = schematic_map(place, sum(ord(char) for char in place))
     try:
-        response = requests.get(
-            "https://nominatim.openstreetmap.org/search",
-            params={"q": place, "format": "jsonv2", "limit": 1, "extratags": 1},
-            headers=headers,
-            timeout=14,
-        )
-        response.raise_for_status()
-        matches = response.json()
-        if not matches:
-            raise RuntimeError("No matching place was found.")
-        match = matches[0]
-        lat, lon = float(match["lat"]), float(match["lon"])
-        display_name = str(match.get("name") or place)
-        place_bbox = match.get("boundingbox")
-        if place_bbox and len(place_bbox) == 4:
-            place_bounds = (float(place_bbox[2]), float(place_bbox[0]), float(place_bbox[3]), float(place_bbox[1]))
-        else:
-            place_bounds = (lon - 0.01, lat - 0.01, lon + 0.01, lat + 0.01)
         radius_km = max(0.35, min(2.0, radius_km))
         preview_radius_km = max(radius_km, min(5.0, preview_radius_km or radius_km))
+        if center is None:
+            response = requests.get(
+                "https://nominatim.openstreetmap.org/search",
+                params={"q": place, "format": "jsonv2", "limit": 1, "extratags": 1},
+                headers=headers,
+                timeout=14,
+            )
+            response.raise_for_status()
+            matches = response.json()
+            if not matches:
+                raise RuntimeError("No matching place was found.")
+            match = matches[0]
+            lat, lon = float(match["lat"]), float(match["lon"])
+            display_name = str(match.get("name") or place)
+            raw_bounds = match.get("boundingbox")
+            if raw_bounds and len(raw_bounds) == 4:
+                place_bounds = (float(raw_bounds[2]), float(raw_bounds[0]), float(raw_bounds[3]), float(raw_bounds[1]))
+            else:
+                place_bounds = (lon - 0.01, lat - 0.01, lon + 0.01, lat + 0.01)
+            city_population = _parse_population(match.get("extratags", {}).get("population"))
+        else:
+            lat, lon = center
+            display_name = place
+            city_population = place_population
         radius_lat = preview_radius_km / 110.57
         radius_lon = min(0.08, radius_lat / max(0.22, math.cos(math.radians(lat))))
         bounds = (lon - radius_lon, lat - radius_lat, lon + radius_lon, lat + radius_lat)
-        city_population = _parse_population(match.get("extratags", {}).get("population"))
+        place_bounds = place_bounds or bounds
     except Exception as error:
         fallback.note = f"LIVE MAP UNAVAILABLE · {str(error)[:74].upper()}"
         return fallback
@@ -404,8 +620,14 @@ def load_city(place: str, use_overture: bool = True, radius_km: float = 1.5, pre
                 city.water.append(points)
             else:
                 city.waterways.append(points)
+                width_m = _waterway_width_m(tags)
+                city.waterway_widths_m.append(width_m)
+                city.waterway_blocked.append(_waterway_is_blocked(tags, width_m))
         elif tags.get("natural") == "coastline" or "waterway" in tags:
             city.waterways.append(points)
+            width_m = _waterway_width_m(tags)
+            city.waterway_widths_m.append(width_m)
+            city.waterway_blocked.append(_waterway_is_blocked(tags, width_m))
         elif "highway" in tags:
             city.roads.append(points)
             city.road_widths_m.append(_road_width_m(tags))
@@ -549,13 +771,152 @@ class MapWorker:
 
     def __init__(self) -> None:
         self.results: queue.Queue[CityMap] = queue.Queue()
+        self.place_results: queue.Queue[tuple[str, list[PlaceSearchResult], str | None]] = queue.Queue()
+        self.search_requests: queue.Queue[str] = queue.Queue(maxsize=1)
+        self.search_lock = threading.Lock()
+        self.search_thread: threading.Thread | None = None
+        self.last_search_started = 0.0
 
-    def request(self, place: str, use_overture: bool, radius_km: float, preview_radius_km: float | None = None) -> None:
-        thread = threading.Thread(target=self._work, args=(place, use_overture, radius_km, preview_radius_km), daemon=True)
+    def request_search(self, place: str) -> None:
+        with self.search_lock:
+            if self.search_requests.full():
+                self.search_requests.get_nowait()
+            self.search_requests.put_nowait(place)
+            if self.search_thread is None or not self.search_thread.is_alive():
+                self.search_thread = threading.Thread(target=self._search_loop, daemon=True)
+                self.search_thread.start()
+
+    def _search_loop(self) -> None:
+        while True:
+            place = self.search_requests.get()
+            with self.search_lock:
+                while not self.search_requests.empty():
+                    place = self.search_requests.get_nowait()
+            wait = 1.0 - (time.monotonic() - self.last_search_started)
+            if wait > 0:
+                time.sleep(wait)
+            with self.search_lock:
+                while not self.search_requests.empty():
+                    place = self.search_requests.get_nowait()
+            self.last_search_started = time.monotonic()
+            self._search(place)
+
+    def _search(self, place: str) -> None:
+        try:
+            self.place_results.put((place, search_places(place), None))
+        except requests.RequestException as error:
+            self.place_results.put((place, [], f"PLACE SEARCH FAILED · {str(error)[:100]}"))
+        except (KeyError, TypeError, ValueError) as error:
+            self.place_results.put((place, [], f"INVALID PLACE RESPONSE · {str(error)[:100]}"))
+
+    def request(
+        self,
+        place: str,
+        use_overture: bool,
+        radius_km: float,
+        preview_radius_km: float | None = None,
+        *,
+        center: tuple[float, float] | None = None,
+        place_bounds: tuple[float, float, float, float] | None = None,
+        place_population: int = 0,
+    ) -> None:
+        thread = threading.Thread(
+            target=self._work,
+            args=(place, use_overture, radius_km, preview_radius_km, center, place_bounds, place_population),
+            daemon=True,
+        )
         thread.start()
 
-    def _work(self, place: str, use_overture: bool, radius_km: float, preview_radius_km: float | None = None) -> None:
-        self.results.put(load_city(place, use_overture, radius_km, preview_radius_km))
+    def _work(
+        self,
+        place: str,
+        use_overture: bool,
+        radius_km: float,
+        preview_radius_km: float | None = None,
+        center: tuple[float, float] | None = None,
+        place_bounds: tuple[float, float, float, float] | None = None,
+        place_population: int = 0,
+    ) -> None:
+        self.results.put(load_city(
+            place,
+            use_overture,
+            radius_km,
+            preview_radius_km,
+            center=center,
+            place_bounds=place_bounds,
+            place_population=place_population,
+        ))
+
+
+class MapTileWorker:
+    """Fetch and persist map tiles without blocking pygame's event loop."""
+
+    url_template = "https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png"
+
+    def __init__(self, cache_dir: Path | None = None) -> None:
+        self.cache_dir = cache_dir or _tile_cache_root()
+        self.requests: queue.Queue[tuple[int, int, int]] = queue.Queue(maxsize=32)
+        self.results: queue.Queue[tuple[tuple[int, int, int], bytes | None, str | None]] = queue.Queue()
+        self.pending: set[tuple[int, int, int]] = set()
+        self.lock = threading.Lock()
+        self.thread: threading.Thread | None = None
+
+    def _path(self, key: tuple[int, int, int]) -> Path:
+        zoom, x, y = key
+        return self.cache_dir / str(zoom) / str(x) / f"{y}.png"
+
+    def request(self, key: tuple[int, int, int]) -> None:
+        zoom, x, y = key
+        count = 1 << zoom
+        if not 0 <= y < count:
+            return
+        key = (zoom, x % count, y)
+        with self.lock:
+            if key in self.pending:
+                return
+            self.pending.add(key)
+            try:
+                self.requests.put_nowait(key)
+            except queue.Full:
+                self.pending.discard(key)
+                return
+        if self.thread is None:
+            self.thread = threading.Thread(target=self._run, daemon=True)
+            self.thread.start()
+
+    def complete(self, key: tuple[int, int, int]) -> None:
+        with self.lock:
+            self.pending.discard(key)
+
+    def _run(self) -> None:
+        last_network_request = 0.0
+        while True:
+            key = self.requests.get()
+            path = self._path(key)
+            try:
+                if path.is_file():
+                    tile_data = path.read_bytes()
+                else:
+                    wait = 0.25 - (time.monotonic() - last_network_request)
+                    if wait > 0:
+                        time.sleep(wait)
+                    zoom, x, y = key
+                    response = requests.get(
+                        self.url_template.format(z=zoom, x=x, y=y),
+                        headers={"User-Agent": "DeadgridStrategy/1.0 (open map data game)"},
+                        timeout=12,
+                    )
+                    last_network_request = time.monotonic()
+                    response.raise_for_status()
+                    tile_data = response.content
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(tile_data)
+                self.results.put((key, tile_data, None))
+            except requests.RequestException as error:
+                last_network_request = time.monotonic()
+                self.results.put((key, None, str(error)))
+            except OSError as error:
+                self.results.put((key, None, f"Tile cache error: {error}"))
 
 
 class Deadgrid:
@@ -565,26 +926,50 @@ class Deadgrid:
         self.screen = pygame.display.set_mode((NATIVE_WIDTH, NATIVE_HEIGHT), pygame.RESIZABLE)
         self.logo = pygame.image.load(str(LOGO_PATH)).convert()
         self.logo.set_colorkey((0, 0, 0))
-        self.menu_logo = pygame.transform.smoothscale(self.logo, (612, 204))
-        self.menu_logo.set_colorkey((0, 0, 0))
         window_icon = pygame.Surface((64, 64))
         window_icon.fill(INK)
         icon_wordmark = pygame.transform.smoothscale(self.logo, (60, 20))
         icon_wordmark.set_colorkey((0, 0, 0))
         window_icon.blit(icon_wordmark, (2, 22))
         pygame.display.set_icon(window_icon)
-        self.canvas = pygame.Surface((WIDTH, HEIGHT))
+        self.canvas = pygame.Surface((NATIVE_WIDTH, NATIVE_HEIGHT))
+        self.render_scale = 1.0
+        self.render_offset = (0.0, 0.0)
+        self._rendered_scale = 0.0
+        self._scaled_font_cache: dict[tuple[str, int, bool], pygame.font.Font] = {}
         self.clock = pygame.time.Clock()
+        self.font_family = "dejavusans"
         self.font = pygame.font.SysFont("dejavusans", 14)
         self.bold = pygame.font.SysFont("dejavusans", 14, bold=True)
         self.small = pygame.font.SysFont("dejavusans", 11, bold=True)
         self.large = pygame.font.SysFont("dejavusans", 34, bold=True)
+        self._font_sizes = {
+            id(self.font): 14,
+            id(self.bold): 14,
+            id(self.small): 11,
+            id(self.large): 34,
+        }
         self.worker = MapWorker()
+        self.tile_worker = MapTileWorker()
+        self.world_tiles: dict[tuple[int, int, int], pygame.Surface] = {}
+        self.world_tile_render_cache: dict[tuple[int, int, int], pygame.Surface] = {}
+        self.world_tile_failures: dict[tuple[int, int, int], float] = {}
         self.preview_map = schematic_map("CITY GRID", 42)
         self.city = self.preview_map
         self.screen_name = "menu"
         self.place_input = "New York, USA"
         self.input_active = False
+        self.search_loading = False
+        self.search_query = ""
+        self.search_results: list[PlaceSearchResult] = []
+        self.selected_place: PlaceSearchResult | None = None
+        self.selected_latitude = 40.7128
+        self.selected_longitude = -74.0060
+        self.world_center = (40.7128, -74.0060)
+        self.world_zoom = 11
+        self.world_pan_drag = False
+        self.world_pan_last = (0, 0)
+        self.world_pan_moved = False
         self.use_overture = True
         self.radius_km = 1.5
         self.initial_infection_percent = 1.0
@@ -597,6 +982,7 @@ class Deadgrid:
         self.area_view_center = (0.5, 0.5)
         self.area_map_surface: pygame.Surface | None = None
         self.area_map_city: CityMap | None = None
+        self.area_map_scale = 0
         self.area_pan_drag = False
         self.area_pan_last = (0, 0)
         self.fullscreen = False
@@ -619,6 +1005,7 @@ class Deadgrid:
         self.saved_scenarios: list[dict[str, Any]] = []
         self.selected_scenario_index = -1
         self.loading = False
+        self.loading_operation = False
         self.message = "SELECT A CITY · CONFIGURE THE WORLD"
         self.message_timer = 0.0
         self.mouse = (0, 0)
@@ -642,6 +1029,12 @@ class Deadgrid:
         self.road_adjacency: list[list[tuple[int, float, bool, bool]]] = []
         self.road_edges: list[tuple[int, int, float, float, float, bool, bool]] = []
         self.road_edge_midpoints = np.empty((0, 2), dtype=np.float32)
+        self.building_blocked_grid = np.zeros((COLLISION_GRID_H, COLLISION_GRID_W), dtype=bool)
+        self.water_blocked_grid = np.zeros((COLLISION_GRID_H, COLLISION_GRID_W), dtype=bool)
+        self.collision_grid = np.zeros((COLLISION_GRID_H, COLLISION_GRID_W), dtype=bool)
+        self.nearest_walkable_grid = np.arange(
+            COLLISION_GRID_H * COLLISION_GRID_W, dtype=np.int32
+        ).reshape((COLLISION_GRID_H, COLLISION_GRID_W))
         self._penalized_edge_keys: set[tuple[int, int]] = set()
         self._barricade_signature: tuple[tuple[float, float], ...] | None = None
         self._barricade_slow_grid = np.ones((GRID_H, GRID_W), dtype=np.float32)
@@ -732,7 +1125,7 @@ class Deadgrid:
         self.starting_resources = int(scenario.get("starting_resources", 1500))
         self.auto_collapse = bool(scenario.get("auto_collapse", True))
         self.use_overture = bool(scenario.get("use_overture", True))
-        self._request_map(self.place_input)
+        self._search_places()
 
     def _notify(self, text: str, duration: float = 3.0) -> None:
         self.message, self.message_timer = text, duration
@@ -746,10 +1139,115 @@ class Deadgrid:
             return
         self.place_input = place
         self.loading = True
+        self.loading_operation = False
         self.input_active = False
         self._notify("GEOCODING PLACE · FETCHING STREET AND BUILDING DATA", 60.0)
         preview_radius = max(3.5, self.radius_km + 1.5)
         self.worker.request(place, self.use_overture, self.radius_km, preview_radius)
+
+    def _search_places(self) -> None:
+        query = self.place_input.strip()
+        if not query:
+            self._notify("ENTER A PLACE TO SEARCH")
+            return
+        self.input_active = False
+        self.search_loading = True
+        self.search_query = query
+        self.search_results.clear()
+        self.worker.request_search(query)
+        self._notify("SEARCHING PLACES · OPENSTREETMAP")
+
+    def _focus_place(self, result: PlaceSearchResult) -> None:
+        self.selected_place = result
+        self.selected_latitude = result.latitude
+        self.selected_longitude = result.longitude
+        self.world_center = (result.latitude, result.longitude)
+        self.place_input = result.name
+        self.input_active = False
+        if result.bounds:
+            west, south, east, north = result.bounds
+            zoom_zero_west, zoom_zero_north = _tile_xy(north, west, 0)
+            zoom_zero_east, zoom_zero_south = _tile_xy(south, east, 0)
+            span_x = max(0.001, (zoom_zero_east - zoom_zero_west) * WORLD_TILE_SIZE)
+            span_y = max(0.001, (zoom_zero_south - zoom_zero_north) * WORLD_TILE_SIZE)
+            fit = min((WORLD_MAP_RECT.w * 0.72) / span_x, (WORLD_MAP_RECT.h * 0.72) / span_y)
+            self.world_zoom = max(MIN_WORLD_ZOOM, min(MAX_WORLD_ZOOM, round(math.log2(max(fit, 1.0)))))
+        self._notify(f"LOCATION SELECTED · {result.name.split(',')[0].upper()}")
+
+    def _start_operation_from_world_map(self) -> None:
+        if self.loading:
+            return
+        result = self.selected_place
+        place = result.name if result else self.place_input.strip()
+        if not place:
+            place = f"{self.selected_latitude:.4f}, {self.selected_longitude:.4f}"
+        self.place_input = place
+        self.input_active = False
+        self.loading = True
+        self.loading_operation = True
+        self._notify("LOADING STREETS AND BUILDINGS · PREPARING OPERATION", 60.0)
+        self.worker.request(
+            place,
+            self.use_overture,
+            self.radius_km,
+            max(3.5, self.radius_km + 1.5),
+            center=(self.selected_latitude, self.selected_longitude),
+            place_bounds=result.bounds if result else None,
+            place_population=result.population if result else 0,
+        )
+
+    def _world_map_rect(self) -> pygame.Rect:
+        return pygame.Rect(352, 0, WIDTH - 352, HEIGHT)
+
+    def _world_geo_at_point(self, point: tuple[int, int], zoom: int | None = None) -> tuple[float, float]:
+        map_rect = self._world_map_rect()
+        active_zoom = self.world_zoom if zoom is None else zoom
+        center_x, center_y = _tile_xy(self.world_center[0], self.world_center[1], active_zoom)
+        tile_x = center_x + (point[0] - map_rect.centerx) / WORLD_TILE_SIZE
+        tile_y = center_y + (point[1] - map_rect.centery) / WORLD_TILE_SIZE
+        count = 1 << active_zoom
+        tile_x %= count
+        tile_y = max(0.0, min(float(count), tile_y))
+        return _latlon_from_tile(tile_x, tile_y, active_zoom)
+
+    def _set_world_center_from_tile(self, tile_x: float, tile_y: float, zoom: int) -> None:
+        count = 1 << zoom
+        tile_x %= count
+        tile_y = max(0.0, min(float(count), tile_y))
+        self.world_center = _latlon_from_tile(tile_x, tile_y, zoom)
+
+    def _zoom_world(self, delta: int, anchor: tuple[int, int]) -> None:
+        target_zoom = max(MIN_WORLD_ZOOM, min(MAX_WORLD_ZOOM, self.world_zoom + delta))
+        if target_zoom == self.world_zoom:
+            return
+        map_rect = self._world_map_rect()
+        before_lat, before_lon = self._world_geo_at_point(anchor)
+        anchor_x, anchor_y = _tile_xy(before_lat, before_lon, target_zoom)
+        center_x = anchor_x - (anchor[0] - map_rect.centerx) / WORLD_TILE_SIZE
+        center_y = anchor_y - (anchor[1] - map_rect.centery) / WORLD_TILE_SIZE
+        self.world_zoom = target_zoom
+        self._set_world_center_from_tile(center_x, center_y, target_zoom)
+
+    def _pan_world(self, dx: int, dy: int) -> None:
+        center_x, center_y = _tile_xy(self.world_center[0], self.world_center[1], self.world_zoom)
+        self._set_world_center_from_tile(
+            center_x - dx / WORLD_TILE_SIZE,
+            center_y - dy / WORLD_TILE_SIZE,
+            self.world_zoom,
+        )
+
+    def _select_world_location(self, point: tuple[int, int]) -> None:
+        latitude, longitude = self._world_geo_at_point(point)
+        self.selected_latitude = latitude
+        self.selected_longitude = longitude
+        self.selected_place = PlaceSearchResult(
+            name=f"Map selection · {latitude:.4f}, {longitude:.4f}",
+            latitude=latitude,
+            longitude=longitude,
+        )
+        self.place_input = self.selected_place.name
+        self.input_active = False
+        self._notify("OPERATION CENTER UPDATED · SET RADIUS OR START")
 
     def _limit_area_selection(self) -> None:
         bounds = self.city.query_bounds
@@ -907,8 +1405,15 @@ class Deadgrid:
                 clipped = project_and_clip(polygon)
                 if len(clipped) >= 3:
                     destination.append(clipped)
-        for line in city.waterways:
-            selected.waterways.extend(self._clip_line(to_area(line)))
+        for line_index, line in enumerate(city.waterways):
+            segments = self._clip_line(to_area(line))
+            selected.waterways.extend(segments)
+            selected.waterway_blocked.extend(
+                [city.waterway_blocked[line_index] if line_index < len(city.waterway_blocked) else True] * len(segments)
+            )
+            selected.waterway_widths_m.extend(
+                [city.waterway_widths_m[line_index] if line_index < len(city.waterway_widths_m) else 12.0] * len(segments)
+            )
 
         if geographic and city.place_population and city.place_bounds:
             area_share = min(1.0, math.pi * radius_km ** 2 / _area_km2(city.place_bounds))
@@ -1011,6 +1516,7 @@ class Deadgrid:
             "population": agent_population[initial_zombie_count:],
         }
         self.civilians["route_node"] = self._snap_agents_to_roads(self.civilians["x"], self.civilians["y"])
+        self._resolve_blocked_positions(self.civilians["x"], self.civilians["y"])
         population_cells_x = np.clip((self.civilians["x"] * (GRID_W / WORLD_W)).astype(np.int32), 0, GRID_W - 1)
         population_cells_y = np.clip((self.civilians["y"] * (GRID_H / WORLD_H)).astype(np.int32), 0, GRID_H - 1)
         occupancy = np.bincount(population_cells_y * GRID_W + population_cells_x, minlength=GRID_W * GRID_H).reshape(GRID_H, GRID_W)
@@ -1028,6 +1534,7 @@ class Deadgrid:
         }
         self.zombies["route_node"] = self._snap_agents_to_roads(self.zombies["x"], self.zombies["y"])
         self.zombies["route_narrow"] = np.zeros(initial_zombie_count, dtype=bool)
+        self._resolve_blocked_positions(self.zombies["x"], self.zombies["y"])
         self.screen_name = "deployment"
         note = city.note or f"{city.source} DATA READY"
         self._notify(f"{city.name.upper()} · {note}", 5.0)
@@ -1044,6 +1551,12 @@ class Deadgrid:
     def _area_content_rect(self) -> pygame.Rect:
         return _fit_rect(AREA_MAP_RECT, self.city.map_aspect_ratio)
 
+    def _physical_size(self, rect: pygame.Rect) -> tuple[int, int]:
+        return max(1, round(rect.w * self.render_scale)), max(1, round(rect.h * self.render_scale))
+
+    def _physical_point(self, point: tuple[int, int]) -> tuple[int, int]:
+        return _scaled_point(point, (self.render_scale, self.render_scale, *self.render_offset))
+
     def _map_point(self, nx: float, ny: float) -> tuple[int, int]:
         rect = self._map_content_rect()
         return int(rect.x + nx * rect.w), int(rect.y + ny * rect.h)
@@ -1052,11 +1565,136 @@ class Deadgrid:
         rect = self._map_content_rect()
         return ((point[0] - rect.x) / rect.w * WORLD_W, (point[1] - rect.y) / rect.h * WORLD_H)
 
+    def _prepare_collision_grid(self, city: CityMap) -> None:
+        building_surface = pygame.Surface((COLLISION_GRID_W, COLLISION_GRID_H))
+        building_surface.fill((0, 0, 0))
+        for polygon in city.buildings:
+            if len(polygon) >= 3:
+                points = [
+                    (round(x * (COLLISION_GRID_W - 1)), round(y * (COLLISION_GRID_H - 1)))
+                    for x, y in polygon
+                ]
+                pygame.draw.polygon(building_surface, (255, 255, 255), points)
+        self.building_blocked_grid = pygame.surfarray.array2d(building_surface).T != 0
+
+        water_surface = pygame.Surface((COLLISION_GRID_W, COLLISION_GRID_H))
+        water_surface.fill((0, 0, 0))
+        for polygon in city.water:
+            if len(polygon) >= 3:
+                points = [
+                    (round(x * (COLLISION_GRID_W - 1)), round(y * (COLLISION_GRID_H - 1)))
+                    for x, y in polygon
+                ]
+                pygame.draw.polygon(water_surface, (255, 255, 255), points)
+        width_km = city.map_width_km or max(0.1, city.preview_radius_km * 2 or city.radius_km * 2)
+        height_km = city.map_height_km or width_km
+        grid_pixels_per_meter = (
+            COLLISION_GRID_W / (width_km * 1000) +
+            COLLISION_GRID_H / (height_km * 1000)
+        ) / 2
+        for index, waterway in enumerate(city.waterways):
+            blocked = city.waterway_blocked[index] if index < len(city.waterway_blocked) else True
+            if not blocked or len(waterway) < 2:
+                continue
+            width_m = city.waterway_widths_m[index] if index < len(city.waterway_widths_m) else 12.0
+            line_width = max(1, round(width_m * grid_pixels_per_meter))
+            points = [
+                (round(x * (COLLISION_GRID_W - 1)), round(y * (COLLISION_GRID_H - 1)))
+                for x, y in waterway
+            ]
+            pygame.draw.lines(water_surface, (255, 255, 255), False, points, line_width)
+        self.water_blocked_grid = pygame.surfarray.array2d(water_surface).T != 0
+        self.collision_grid = self.building_blocked_grid | self.water_blocked_grid
+
+        walkable = ~self.collision_grid
+        if not np.any(walkable):
+            self.collision_grid.fill(False)
+            walkable = ~self.collision_grid
+        nearest = np.full((COLLISION_GRID_H, COLLISION_GRID_W), -1, dtype=np.int32)
+        queue_cells = deque()
+        for y, x in np.argwhere(walkable):
+            index = int(y * COLLISION_GRID_W + x)
+            nearest[y, x] = index
+            queue_cells.append(index)
+        while queue_cells:
+            index = queue_cells.popleft()
+            y, x = divmod(index, COLLISION_GRID_W)
+            source = nearest[y, x]
+            for next_x, next_y in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
+                if 0 <= next_x < COLLISION_GRID_W and 0 <= next_y < COLLISION_GRID_H and nearest[next_y, next_x] < 0:
+                    nearest[next_y, next_x] = source
+                    queue_cells.append(next_y * COLLISION_GRID_W + next_x)
+        self.nearest_walkable_grid = nearest
+
+    def _blocked_at(self, x: np.ndarray, y: np.ndarray, *, allow_water: bool = False) -> np.ndarray:
+        grid_x = np.clip((np.asarray(x) * (COLLISION_GRID_W / WORLD_W)).astype(np.int32), 0, COLLISION_GRID_W - 1)
+        grid_y = np.clip((np.asarray(y) * (COLLISION_GRID_H / WORLD_H)).astype(np.int32), 0, COLLISION_GRID_H - 1)
+        blocked = self.building_blocked_grid[grid_y, grid_x]
+        if not allow_water:
+            blocked = blocked | self.water_blocked_grid[grid_y, grid_x]
+        return blocked
+
+    def _segment_is_walkable(self, start: tuple[float, float], end: tuple[float, float]) -> bool:
+        distance = max(abs(end[0] - start[0]), abs(end[1] - start[1]))
+        sample_count = max(1, math.ceil(distance / COLLISION_STEP))
+        fractions = np.linspace(0.0, 1.0, sample_count + 1, dtype=np.float32)
+        x = start[0] + (end[0] - start[0]) * fractions
+        y = start[1] + (end[1] - start[1]) * fractions
+        return not bool(np.any(self._blocked_at(x, y)))
+
+    def _resolve_blocked_positions(self, x: np.ndarray, y: np.ndarray) -> None:
+        blocked = self._blocked_at(x, y)
+        if not np.any(blocked):
+            return
+        grid_x = np.clip((x[blocked] * (COLLISION_GRID_W / WORLD_W)).astype(np.int32), 0, COLLISION_GRID_W - 1)
+        grid_y = np.clip((y[blocked] * (COLLISION_GRID_H / WORLD_H)).astype(np.int32), 0, COLLISION_GRID_H - 1)
+        nearest = self.nearest_walkable_grid[grid_y, grid_x]
+        x[blocked] = ((nearest % COLLISION_GRID_W) + 0.5) * (WORLD_W / COLLISION_GRID_W)
+        y[blocked] = ((nearest // COLLISION_GRID_W) + 0.5) * (WORLD_H / COLLISION_GRID_H)
+
+    def _move_with_collision(self, x: np.ndarray, y: np.ndarray, dx: np.ndarray, dy: np.ndarray) -> None:
+        candidate_x = np.clip(x + dx, 2, WORLD_W - 2)
+        distance_x = np.abs(candidate_x - x)
+        sample_count = max(1, math.ceil(float(np.max(distance_x, initial=0.0)) / COLLISION_STEP))
+        blocked_x = np.zeros(len(x), dtype=bool)
+        for step in range(1, sample_count + 1):
+            fraction = min(1.0, step / sample_count)
+            blocked_x |= self._blocked_at(x + (candidate_x - x) * fraction, y)
+        x += np.where(blocked_x, 0.0, candidate_x - x)
+
+        candidate_y = np.clip(y + dy, 2, WORLD_H - 2)
+        distance_y = np.abs(candidate_y - y)
+        sample_count = max(1, math.ceil(float(np.max(distance_y, initial=0.0)) / COLLISION_STEP))
+        blocked_y = np.zeros(len(y), dtype=bool)
+        for step in range(1, sample_count + 1):
+            fraction = min(1.0, step / sample_count)
+            blocked_y |= self._blocked_at(x, y + (candidate_y - y) * fraction)
+        y += np.where(blocked_y, 0.0, candidate_y - y)
+
     def _prepare_road_network(self, city: CityMap) -> None:
+        self._prepare_collision_grid(city)
         self.road_nodes, self.road_adjacency, self.road_edges = _build_road_graph(city)
         if not len(self.road_nodes):
             fallback = schematic_map(city.name)
             self.road_nodes, self.road_adjacency, self.road_edges = _build_road_graph(fallback)
+        clear_edges: set[tuple[int, int]] = set()
+        retained_edges = []
+        for edge in self.road_edges:
+            first, second = int(edge[0]), int(edge[1])
+            start = tuple(float(value) for value in self.road_nodes[first])
+            end = tuple(float(value) for value in self.road_nodes[second])
+            if self._segment_is_walkable(start, end):
+                clear_edges.add((min(first, second), max(first, second)))
+                retained_edges.append(edge)
+        self.road_edges = retained_edges
+        self.road_adjacency = [
+            [
+                (neighbor, cost, bridge, narrow)
+                for neighbor, cost, bridge, narrow in edges
+                if (min(node, neighbor), max(node, neighbor)) in clear_edges
+            ]
+            for node, edges in enumerate(self.road_adjacency)
+        ]
         node_cell_x = np.clip((self.road_nodes[:, 0] * (GRID_W / WORLD_W)).astype(np.int32), 0, GRID_W - 1)
         node_cell_y = np.clip((self.road_nodes[:, 1] * (GRID_H / WORLD_H)).astype(np.int32), 0, GRID_H - 1)
         self.road_node_cell = (node_cell_y * GRID_W + node_cell_x).tolist()
@@ -1069,8 +1707,16 @@ class Deadgrid:
         self.road_node_bins = {}
         bucket_size = 64.0
         for node_id, (x, y) in enumerate(self.road_nodes):
+            if self._blocked_at(np.array([x]), np.array([y]))[0]:
+                continue
             bucket = (int(x // bucket_size), int(y // bucket_size))
             self.road_node_bins.setdefault(bucket, []).append(node_id)
+        valid_road_nodes = np.asarray(
+            [node_id for nodes in self.road_node_bins.values() for node_id in nodes],
+            dtype=np.int32,
+        )
+        if not len(valid_road_nodes):
+            valid_road_nodes = np.arange(len(self.road_nodes), dtype=np.int32)
         self.road_snap_grid = np.empty((GRID_H, GRID_W), dtype=np.int32)
         for grid_y in range(GRID_H):
             for grid_x in range(GRID_W):
@@ -1088,6 +1734,8 @@ class Deadgrid:
                     )
                     if candidates and radius >= 1:
                         break
+                if not candidates:
+                    candidates = valid_road_nodes.tolist()
                 candidate_array = np.asarray(candidates, dtype=np.int32)
                 distance = (self.road_nodes[candidate_array, 0] - x) ** 2 + (self.road_nodes[candidate_array, 1] - y) ** 2
                 self.road_snap_grid[grid_y, grid_x] = int(candidate_array[np.argmin(distance)])
@@ -1339,10 +1987,12 @@ class Deadgrid:
         distance = np.maximum(1, np.hypot(dx, dy))
         speed = np.full(len(x), 28.0, dtype=np.float32)
         speed[crowd["route_narrow"] & active_route] *= 0.72
-        x[active_route] += dx[active_route] / distance[active_route] * speed[active_route] * dt
-        y[active_route] += dy[active_route] / distance[active_route] * speed[active_route] * dt
-        x[active_route] = np.clip(x[active_route], 8, WORLD_W - 8)
-        y[active_route] = np.clip(y[active_route], 8, WORLD_H - 8)
+        self._move_with_collision(
+            x,
+            y,
+            np.where(active_route, dx / distance * speed * dt, 0.0),
+            np.where(active_route, dy / distance * speed * dt, 0.0),
+        )
 
         removed = np.zeros(len(x), dtype=bool)
         for zone in (unit for unit in self.units if unit["kind"] == "SAFE ZONE"):
@@ -1415,7 +2065,7 @@ class Deadgrid:
             alpha = pygame.surfarray.pixels_alpha(layer)
             alpha[:] = alpha_grid.T
             del alpha
-            self.intel_layers[mode] = pygame.transform.scale(layer, self._map_content_rect().size)
+            self.intel_layers[mode] = pygame.transform.scale(layer, self._physical_size(self._map_content_rect()))
 
     def _draw_population(self, surface: pygame.Surface) -> None:
         civilians = self.civilians
@@ -1423,28 +2073,50 @@ class Deadgrid:
             return
         pixels = pygame.surfarray.pixels3d(surface)
         map_rect = self._map_content_rect()
+        transform = _surface_transform(surface)
         if len(civilians["x"]):
-            pixels_x = np.clip((civilians["x"] * (map_rect.w / WORLD_W)).astype(np.int32), 0, map_rect.w - 1) + map_rect.x
-            pixels_y = np.clip((civilians["y"] * (map_rect.h / WORLD_H)).astype(np.int32), 0, map_rect.h - 1) + map_rect.y
+            logical_x = (map_rect.x + civilians["x"] / WORLD_W * map_rect.w).astype(np.int32)
+            logical_y = (map_rect.y + civilians["y"] / WORLD_H * map_rect.h).astype(np.int32)
+            if transform:
+                scale_x, scale_y, offset_x, offset_y = transform
+                logical_x = np.rint(logical_x * scale_x + offset_x).astype(np.int32)
+                logical_y = np.rint(logical_y * scale_y + offset_y).astype(np.int32)
+                bound_x, bound_y = round(map_rect.w * scale_x), round(map_rect.h * scale_y)
+                pixels_x = np.clip(logical_x, round(map_rect.x * scale_x + offset_x), round(map_rect.x * scale_x + offset_x) + bound_x - 1)
+                pixels_y = np.clip(logical_y, round(map_rect.y * scale_y + offset_y), round(map_rect.y * scale_y + offset_y) + bound_y - 1)
+            else:
+                pixels_x = np.clip(logical_x, map_rect.x, map_rect.right - 1)
+                pixels_y = np.clip(logical_y, map_rect.y, map_rect.bottom - 1)
             colors = np.empty((len(pixels_x), 3), dtype=np.uint8)
             colors[:] = (250, 250, 242)
             colors[civilians["status"] == 1] = LIME
             pixels[pixels_x, pixels_y] = colors
-            pixels[np.minimum(pixels_x + 1, map_rect.right - 1), pixels_y] = colors
+            pixel_right = round(map_rect.right * transform[0] + transform[2]) - 1 if transform else map_rect.right - 1
+            pixels[np.minimum(pixels_x + 1, pixel_right), pixels_y] = colors
         if len(self.zombies["x"]):
-            pixels_x = np.clip((self.zombies["x"] * (map_rect.w / WORLD_W)).astype(np.int32), 0, map_rect.w - 1) + map_rect.x
-            pixels_y = np.clip((self.zombies["y"] * (map_rect.h / WORLD_H)).astype(np.int32), 0, map_rect.h - 1) + map_rect.y
+            logical_x = (map_rect.x + self.zombies["x"] / WORLD_W * map_rect.w).astype(np.int32)
+            logical_y = (map_rect.y + self.zombies["y"] / WORLD_H * map_rect.h).astype(np.int32)
+            if transform:
+                scale_x, scale_y, offset_x, offset_y = transform
+                left, top = round(map_rect.x * scale_x + offset_x), round(map_rect.y * scale_y + offset_y)
+                pixels_x = np.clip(np.rint(logical_x * scale_x + offset_x).astype(np.int32), left, left + round(map_rect.w * scale_x) - 1)
+                pixels_y = np.clip(np.rint(logical_y * scale_y + offset_y).astype(np.int32), top, top + round(map_rect.h * scale_y) - 1)
+            else:
+                pixels_x = np.clip(logical_x, map_rect.x, map_rect.right - 1)
+                pixels_y = np.clip(logical_y, map_rect.y, map_rect.bottom - 1)
             pixels[pixels_x, pixels_y] = LIME
-            pixels[np.minimum(pixels_x + 1, map_rect.right - 1), pixels_y] = LIME
+            pixel_right = round(map_rect.right * transform[0] + transform[2]) - 1 if transform else map_rect.right - 1
+            pixels[np.minimum(pixels_x + 1, pixel_right), pixels_y] = LIME
         del pixels
 
     def _draw_area_map(self, surface: pygame.Surface) -> None:
-        if self.area_map_surface is None or self.area_map_city is not self.city:
-            scale = 2
+        scale = max(2, min(8, math.ceil(self.render_scale * self.area_zoom)))
+        if self.area_map_surface is None or self.area_map_city is not self.city or self.area_map_scale != scale:
             size = (AREA_MAP_RECT.w * scale, AREA_MAP_RECT.h * scale)
             self.area_map_surface = pygame.Surface(size)
             self._draw_city_uncached(self.area_map_surface, self.area_map_surface.get_rect(), self.city)
             self.area_map_city = self.city
+            self.area_map_scale = scale
 
         source = self.area_map_surface
         source_content = _fit_rect(source.get_rect(), self.city.map_aspect_ratio)
@@ -1458,24 +2130,26 @@ class Deadgrid:
             source_height,
         )
         source_rect.clamp_ip(source_content)
-        view = pygame.transform.scale(source.subsurface(source_rect), target_content.size)
-        surface.blit(view, target_content.topleft)
+        view = pygame.transform.smoothscale(source.subsurface(source_rect), self._physical_size(target_content))
+        _scaled_blit(surface, view, target_content.topleft, source_is_native=True)
 
     def _draw_city(self, surface: pygame.Surface, rect: pygame.Rect, city: CityMap, zoom: float = 1.0, view_center: tuple[float, float] = (0.5, 0.5)) -> None:
-        key = (id(city), rect.w, rect.h, round(zoom, 2), round(view_center[0], 4), round(view_center[1], 4))
+        scale = self.render_scale if _surface_transform(surface) else 1.0
+        pixel_width, pixel_height = max(1, round(rect.w * scale)), max(1, round(rect.h * scale))
+        key = (id(city), pixel_width, pixel_height, round(zoom, 2), round(view_center[0], 4), round(view_center[1], 4))
         cached = self.city_surface_cache.get(key)
         if cached is None:
-            cached = pygame.Surface(rect.size)
+            cached = pygame.Surface((pixel_width, pixel_height))
             self._draw_city_uncached(cached, cached.get_rect(), city, zoom, view_center)
             if len(self.city_surface_cache) >= 8:
                 self.city_surface_cache.pop(next(iter(self.city_surface_cache)))
             self.city_surface_cache[key] = cached
-        surface.blit(cached, rect.topleft)
+        _scaled_blit(surface, cached, rect.topleft, source_is_native=True)
 
     def _draw_city_uncached(self, surface: pygame.Surface, rect: pygame.Rect, city: CityMap, zoom: float = 1.0, view_center: tuple[float, float] = (0.5, 0.5)) -> None:
-        pygame.draw.rect(surface, MAP_BASE, rect)
+        draw.rect(surface, MAP_BASE, rect)
         previous_clip = surface.get_clip()
-        surface.set_clip(rect)
+        _set_scaled_clip(surface, rect)
         map_rect = _fit_rect(rect, city.map_aspect_ratio)
         display_width_km = city.map_width_km or max(0.1, city.preview_radius_km * 2 or city.radius_km * 2)
         pixels_per_meter = map_rect.w / (display_width_km * 1000)
@@ -1490,23 +2164,23 @@ class Deadgrid:
         for park in city.parks:
             points = screen_points(park)
             if len(points) >= 3:
-                pygame.draw.polygon(surface, (162, 190, 147), points)
+                draw.polygon(surface, MAP_PARK, points)
         for water in city.water:
             points = screen_points(water)
             if len(points) >= 3:
-                pygame.draw.polygon(surface, (91, 153, 166), points)
+                draw.polygon(surface, MAP_WATER, points)
                 outline_width = max(1, round(1.2 * pixels_per_meter * zoom))
-                pygame.draw.polygon(surface, (115, 177, 187), points, outline_width)
-        waterway_width = max(1, round(12 * pixels_per_meter * zoom))
-        for waterway in city.waterways:
+                draw.polygon(surface, (25, 57, 67), points, outline_width)
+        for index, waterway in enumerate(city.waterways):
             points = screen_points(waterway)
             if len(points) >= 2:
-                pygame.draw.lines(surface, (91, 153, 166), False, points, waterway_width)
+                width_m = city.waterway_widths_m[index] if index < len(city.waterway_widths_m) else 12.0
+                waterway_width = max(1, round(width_m * pixels_per_meter * zoom))
+                draw.lines(surface, MAP_WATER, False, points, waterway_width)
 
         # Streets are drawn before footprints so buildings stay visually distinct.
-        minor_types = {"residential", "living_street", "service", "unclassified", "footway", "path", "track", "pedestrian", "cycleway"}
         major_types = {"motorway", "motorway_link", "trunk", "trunk_link", "primary", "primary_link", "secondary", "secondary_link", "tertiary", "tertiary_link"}
-        roads_by_layer: dict[str, list[tuple[list[tuple[int, int]], str, float]]] = {"minor": [], "major": [], "bridge": []}
+        road_lines: list[tuple[list[tuple[int, int]], float, bool]] = []
         for index, road in enumerate(city.roads):
             points = screen_points(road)
             if len(points) < 2:
@@ -1514,50 +2188,20 @@ class Deadgrid:
             road_type = city.road_types[index] if index < len(city.road_types) else "residential"
             attributes = set(road_type.split("|"))
             road_class = next(iter(attributes - {"bridge", "narrow", "oneway", "oneway_reverse"}), "residential")
-            layer = "bridge" if "bridge" in attributes else ("major" if road_class in major_types else "minor")
             width_m = city.road_widths_m[index] if index < len(city.road_widths_m) else _road_width_m({"highway": road_class})
-            roads_by_layer[layer].append((points, road_class, width_m))
+            if "bridge" in attributes:
+                width_m = max(width_m, 10.0)
+            road_lines.append((points, width_m, road_class in major_types))
+        for points, width_m, major in road_lines:
+            road_width = max(1, round(width_m * pixels_per_meter * zoom))
+            if major:
+                road_width = max(road_width, round(5.0 * pixels_per_meter * zoom))
+            draw.lines(surface, MAP_ROAD, False, points, road_width)
 
-        def draw_markings(points: list[tuple[int, int]], color: tuple[int, int, int], dash_length: float) -> None:
-            for start, end in zip(points, points[1:]):
-                dx, dy = end[0] - start[0], end[1] - start[1]
-                length = math.hypot(dx, dy)
-                offset = 0.0
-                while offset < length:
-                    finish = min(length, offset + dash_length * 0.58)
-                    first = (round(start[0] + dx * offset / length), round(start[1] + dy * offset / length))
-                    second = (round(start[0] + dx * finish / length), round(start[1] + dy * finish / length))
-                    pygame.draw.line(surface, color, first, second, 1)
-                    offset += dash_length
-
-        for layer, roads in roads_by_layer.items():
-            for points, road_class, width_m in roads:
-                if layer == "bridge":
-                    width_m = max(width_m, 10.0)
-                inner_width = max(1, round(width_m * pixels_per_meter * zoom))
-                casing_width = max(inner_width, round((width_m + 2.5) * pixels_per_meter * zoom))
-                casing, pavement = (75, 113, 124), (177, 195, 188)
-                if layer == "major":
-                    casing, pavement = (107, 122, 119), (211, 210, 185)
-                elif layer == "minor":
-                    casing, pavement = (135, 149, 136), (224, 225, 204)
-                pygame.draw.lines(surface, casing, False, points, casing_width)
-                pygame.draw.lines(surface, pavement, False, points, inner_width)
-                if layer != "minor" and inner_width >= 3:
-                    marking = (219, 195, 132) if layer == "bridge" else (169, 151, 108)
-                    draw_markings(points, marking, max(3.0, 13 * pixels_per_meter * zoom))
-
-        building_colors = {
-            "residential": (219, 216, 188),
-            "commercial": (222, 194, 151),
-            "industrial": (173, 193, 193),
-            "civic": (224, 181, 158),
-        }
-        for index, polygon in enumerate(city.buildings):
+        for polygon in city.buildings:
             points = screen_points(polygon)
             if len(points) >= 3:
-                category = city.building_types[index] if index < len(city.building_types) else "residential"
-                pygame.draw.polygon(surface, building_colors.get(category, MAP_BUILDING), points)
+                draw.polygon(surface, MAP_BUILDING, points)
                 bounds = pygame.Rect(
                     min(point[0] for point in points),
                     min(point[1] for point in points),
@@ -1565,13 +2209,21 @@ class Deadgrid:
                     max(point[1] for point in points) - min(point[1] for point in points),
                 )
                 if bounds.w >= 3 and bounds.h >= 3:
-                    pygame.draw.polygon(surface, (74, 91, 83), points, max(1, round(pixels_per_meter * zoom)))
+                    draw.polygon(surface, MAP_BUILDING_EDGE, points, max(1, round(pixels_per_meter * zoom)))
 
         surface.set_clip(previous_clip)
-        pygame.draw.rect(surface, LINE, rect, 1)
+        draw.rect(surface, LINE, rect, 1)
 
     def _text(self, surface: pygame.Surface, text: str, x: int, y: int, color: tuple[int, int, int] = TEXT, font: pygame.font.Font | None = None) -> None:
-        surface.blit((font or self.font).render(str(text), True, color), (x, y))
+        selected_font = font or self.font
+        transform = _surface_transform(surface)
+        if transform:
+            size = max(1, round(self._font_sizes.get(id(selected_font), selected_font.get_height()) * transform[0]))
+            key = (self.font_family, size, selected_font.get_bold())
+            if key not in self._scaled_font_cache:
+                self._scaled_font_cache[key] = pygame.font.SysFont(key[0], size, bold=key[2])
+            selected_font = self._scaled_font_cache[key]
+        _scaled_blit(surface, selected_font.render(str(text), True, color), (x, y), source_is_native=bool(transform))
 
     def _button(self, surface: pygame.Surface, key: str, rect: pygame.Rect, label: str, *, active: bool = False, disabled: bool = False, accent: tuple[int, int, int] = LIME, subtitle: str | None = None) -> None:
         self.hit_targets[key] = rect
@@ -1579,8 +2231,8 @@ class Deadgrid:
         border = accent if active else LINE
         if disabled:
             fill, border = (20, 27, 27), (34, 45, 44)
-        pygame.draw.rect(surface, fill, rect, border_radius=5)
-        pygame.draw.rect(surface, border, rect, 1, border_radius=5)
+        draw.rect(surface, fill, rect, border_radius=5)
+        draw.rect(surface, border, rect, 1, border_radius=5)
         tint = (75, 85, 81) if disabled else (accent if active else TEXT)
         compact = rect.h <= 28
         self._text(surface, label, rect.x + (7 if compact else 10), rect.y + (4 if compact else (8 if subtitle else 11)), tint, self.small if compact else self.bold)
@@ -1636,16 +2288,16 @@ class Deadgrid:
         x = button.x - width - 10 if button.x > width + 20 else button.right + 10
         y = max(84, min(HEIGHT - height - 8, button.centery - height // 2))
         box = pygame.Rect(x, y, width, height)
-        pygame.draw.rect(surface, PANEL_HI, box, border_radius=4)
-        pygame.draw.rect(surface, CYAN, box, 1, border_radius=4)
+        draw.rect(surface, PANEL_HI, box, border_radius=4)
+        draw.rect(surface, CYAN, box, 1, border_radius=4)
         self._text(surface, title, x + 10, y + 6, TEXT, self.bold)
         for index, line in enumerate(lines):
             self._text(surface, line, x + 10, y + 24 + index * 14, MUTED, self.small)
 
     def _header(self, surface: pygame.Surface, mode: str) -> None:
-        pygame.draw.rect(surface, PANEL, (0, 0, WIDTH, 78))
-        pygame.draw.line(surface, LINE, (0, 77), (WIDTH, 77), 1)
-        pygame.draw.rect(surface, LIME, (20, 19, 4, 34), border_radius=2)
+        draw.rect(surface, PANEL, (0, 0, WIDTH, 78))
+        draw.line(surface, LINE, (0, 77), (WIDTH, 77), 1)
+        draw.rect(surface, LIME, (20, 19, 4, 34), border_radius=2)
         self._text(surface, "DEADGRID", 36, 16, TEXT, self.bold)
         self._text(surface, "CITY CONTAINMENT  /  FIELD COMMAND", 36, 38, MUTED, self.small)
         self._text(surface, mode, 600, 27, LIME, self.small)
@@ -1658,55 +2310,171 @@ class Deadgrid:
     def _draw_menu(self) -> None:
         surface = self.canvas
         surface.fill(INK)
-        self._header(surface, "INCIDENT COMMAND  /  01")
-        preview = pygame.Rect(695, 105, 645, 665)
-        self._draw_city(surface, preview, self.preview_map)
-        shade = pygame.Surface(preview.size, pygame.SRCALPHA)
-        shade.fill((13, 23, 24, 65))
-        surface.blit(shade, preview.topleft)
-        ox, oy = preview.x + preview.w // 2, preview.y + preview.h // 2
-        pygame.draw.circle(surface, (222, 83, 73), (ox, oy), 76, 1)
-        pygame.draw.circle(surface, (222, 83, 73), (ox, oy), 38, 1)
-        pygame.draw.circle(surface, RED, (ox, oy), 5)
-        surface.blit(self.menu_logo, (36, 112))
-        pygame.draw.line(surface, LINE, (36, 339), (654, 339), 1)
-        self._text(surface, "AREA OF OPERATIONS", 36, 361, CYAN, self.small)
-        input_rect = pygame.Rect(36, 389, 615, 47)
+        self.hit_targets = {}
+        map_rect = self._world_map_rect()
+        self._draw_world_map(surface, map_rect)
+        draw.rect(surface, PANEL, (0, 0, 352, HEIGHT))
+        draw.line(surface, LINE, (351, 0), (351, HEIGHT), 1)
+        _scaled_blit(surface, self.logo, pygame.Rect(20, 13, 310, 103))
+        self._text(surface, "LOCATION SEARCH", 16, 112, CYAN, self.small)
+        input_rect = pygame.Rect(16, 132, 320, 42)
         self.hit_targets["place_input"] = input_rect
-        pygame.draw.rect(surface, PANEL_HI if self.input_active else PANEL, input_rect, border_radius=5)
-        pygame.draw.rect(surface, LIME if self.input_active else LINE, input_rect, 1, border_radius=5)
-        shown = self.place_input[-52:]
+        draw.rect(surface, PANEL_HI if self.input_active else PANEL, input_rect, border_radius=5)
+        draw.rect(surface, LIME if self.input_active else LINE, input_rect, 1, border_radius=5)
+        shown = self.place_input[-35:]
         self._text(surface, shown + ("|" if self.input_active and int(time.time() * 2) % 2 else ""), input_rect.x + 13, input_rect.y + 14, TEXT)
-        self._text(surface, "QUICK DEPLOY", 36, 454, MUTED, self.small)
-        for index, place in enumerate(PRESETS):
-            col, row = index % 2, index // 2
-            key = f"preset_{index}"
-            self._button(surface, key, pygame.Rect(36 + col * 310, 478 + row * 47, 300, 38), place, accent=CYAN)
-        self._button(surface, "overture", pygame.Rect(36, 591, 24, 24), "", active=self.use_overture, accent=CYAN)
-        pygame.draw.circle(surface, CYAN if self.use_overture else MUTED, (48, 603), 5 if self.use_overture else 3)
-        self._text(surface, "SUPPLEMENT BUILDINGS WITH OVERTURE MAPS", 70, 595, TEXT, self.small)
-        self._text(surface, "AREA RADIUS", 36, 624, CYAN, self.small)
-        radius_rect = pygame.Rect(36, 646, 266, 12)
+        self._button(
+            surface,
+            "search_places",
+            pygame.Rect(16, 182, 320, 36),
+            "SEARCH PLACES" if not self.search_loading else "SEARCHING…",
+            disabled=self.search_loading or self.loading,
+            accent=CYAN,
+        )
+        self._text(surface, "SEARCH RESULTS" if self.search_results else "SUGGESTED LOCATIONS", 16, 233, MUTED, self.small)
+        if self.search_results:
+            for index, result in enumerate(self.search_results[:5]):
+                y = 254 + index * 45
+                label = result.name.split(",")[0][:37]
+                detail = ", ".join(result.name.split(",")[1:3]).strip()[:39]
+                selected = result is self.selected_place
+                self._button(
+                    surface,
+                    f"place_result_{index}",
+                    pygame.Rect(16, y, 320, 40),
+                    label,
+                    active=selected,
+                    accent=LIME if selected else CYAN,
+                )
+                if detail:
+                    self._text(surface, detail, 27, y + 23, MUTED, self.small)
+        else:
+            for index, place in enumerate(PRESETS):
+                y = 254 + index * 42
+                self._button(surface, f"preset_{index}", pygame.Rect(16, y, 320, 36), place, accent=CYAN)
+        selected_name = self.selected_place.name if self.selected_place else "Custom map location"
+        self._text(surface, "SELECTED OPERATION AREA", 16, 474, CYAN, self.small)
+        self._text(surface, selected_name.split(",")[0][:35].upper(), 16, 494, TEXT, self.bold)
+        population_estimate = self._selected_population_estimate()
+        if population_estimate:
+            population_label = f"EST. {population_estimate:,} RESIDENTS  ·  AREA SHARE"
+        else:
+            population_label = "POPULATION ESTIMATE AFTER MAP LOAD"
+        self._text(surface, population_label, 16, 518, MUTED, self.small)
+        self._text(surface, f"{self.selected_latitude:.4f}°, {self.selected_longitude:.4f}°", 16, 537, MUTED, self.small)
+        self._text(surface, "OUTBREAK RADIUS", 16, 570, CYAN, self.small)
+        radius_rect = pygame.Rect(16, 592, 320, 12)
         self.hit_targets["radius_slider"] = radius_rect
-        pygame.draw.rect(surface, LINE, (radius_rect.x, radius_rect.y + 4, radius_rect.w, 4), border_radius=2)
+        draw.rect(surface, LINE, (radius_rect.x, radius_rect.y + 4, radius_rect.w, 4), border_radius=2)
         radius_ratio = (self.radius_km - 0.35) / (2.0 - 0.35)
-        pygame.draw.rect(surface, LIME, (radius_rect.x, radius_rect.y + 4, int(radius_rect.w * radius_ratio), 4), border_radius=2)
-        pygame.draw.circle(surface, TEXT, (int(radius_rect.x + radius_rect.w * radius_ratio), radius_rect.centery), 7)
-        self._text(surface, f"{self.radius_km:.2f} KM  ·  {math.pi * self.radius_km ** 2:.1f} KM²", 36, 663, MUTED, self.small)
-        self._text(surface, "INITIAL HORDE", 359, 624, CYAN, self.small)
+        draw.rect(surface, LIME, (radius_rect.x, radius_rect.y + 4, int(radius_rect.w * radius_ratio), 4), border_radius=2)
+        draw.circle(surface, TEXT, (int(radius_rect.x + radius_rect.w * radius_ratio), radius_rect.centery), 7)
+        self._text(surface, f"{self.radius_km:.2f} KM  ·  {math.pi * self.radius_km ** 2:.1f} KM²", 16, 611, MUTED, self.small)
+        self._text(surface, "INITIAL HORDE", 16, 646, CYAN, self.small)
         for index, percentage in enumerate((0.5, 1.0, 2.0, 5.0)):
             label = f"{percentage:g}%"
-            self._button(surface, f"infect_{label}", pygame.Rect(359 + index * 67, 641, 61, 31), label, active=self.initial_infection_percent == percentage, accent=RED)
-        self._text(surface, "© OpenStreetMap contributors  ·  Overture Maps Foundation", 718, 736, (67, 83, 73), self.small)
-        if self.loading:
-            pygame.draw.rect(surface, PANEL, (36, 680, 615, 54), border_radius=5)
-            self._text(surface, "QUERYING OPEN MAP DATA", 52, 689, LIME, self.small)
-            self._text(surface, "Geocoding place · loading streets and building footprints…", 52, 709, MUTED, self.small)
-            pygame.draw.rect(surface, LIME, (36, 729, 615, 2))
-        else:
-            self._button(surface, "build_plan", pygame.Rect(36, 676, 300, 57), "BUILD RESPONSE PLAN  →", accent=LIME, subtitle="REVIEW MAP · DEPLOY")
-            self._button(surface, "config", pygame.Rect(346, 676, 305, 57), "WORLD SETTINGS", accent=CYAN, subtitle="TUNE & SAVE SCENARIOS")
-        self._text(surface, self.message if self.message_timer > 0 else f"SAVED SCENARIOS  {len(self.saved_scenarios)}  ·  STARTING INFECTION  {self.initial_infection_percent:g}%", 36, 779, MUTED, self.small)
+            self._button(surface, f"infect_{label}", pygame.Rect(16 + index * 79, 666, 72, 30), label, active=self.initial_infection_percent == percentage, accent=RED)
+        self._button(surface, "overture", pygame.Rect(16, 707, 24, 24), "", active=self.use_overture, accent=CYAN)
+        draw.circle(surface, CYAN if self.use_overture else MUTED, (28, 719), 5 if self.use_overture else 3)
+        self._text(surface, "OVERTURE BUILDING DATA", 49, 712, TEXT, self.small)
+        self._button(surface, "config", pygame.Rect(197, 704, 139, 30), "WORLD SETTINGS", accent=CYAN)
+        button_label = "LOADING MAP DATA…" if self.loading else "START OPERATION"
+        self._button(
+            surface,
+            "start_operation",
+            pygame.Rect(16, 752, 320, 56),
+            button_label,
+            active=not self.loading,
+            disabled=self.loading,
+            accent=LIME,
+        )
+        status = self.message if self.message_timer > 0 else "DRAG TO PAN · SCROLL TO ZOOM · CLICK TO SET CENTER"
+        self._text(surface, status[:49], 16, 735, AMBER if "FAILED" in status else MUTED, self.small)
+        self._draw_tooltip(surface)
+
+    def _selected_population_estimate(self) -> int:
+        result = self.selected_place
+        if result is None or result.population <= 0 or result.bounds is None:
+            return 0
+        west, south, east, north = result.bounds
+        width_km = max(0.0, east - west) * 111.32 * max(0.05, math.cos(math.radians(result.latitude)))
+        height_km = max(0.0, north - south) * 110.57
+        place_area = width_km * height_km
+        if place_area <= 0:
+            return 0
+        area_share = min(1.0, math.pi * self.radius_km ** 2 / place_area)
+        return max(1, round(result.population * area_share))
+
+    def _draw_world_map(self, surface: pygame.Surface, map_rect: pygame.Rect) -> None:
+        draw.rect(surface, (13, 22, 23), map_rect)
+        zoom = self.world_zoom
+        tile_count = 1 << zoom
+        center_x, center_y = _tile_xy(self.world_center[0], self.world_center[1], zoom)
+        half_tiles_x = map_rect.w / (2 * WORLD_TILE_SIZE)
+        half_tiles_y = map_rect.h / (2 * WORLD_TILE_SIZE)
+        first_x = math.floor(center_x - half_tiles_x)
+        last_x = math.floor(center_x + half_tiles_x)
+        first_y = max(0, math.floor(center_y - half_tiles_y))
+        last_y = min(tile_count - 1, math.floor(center_y + half_tiles_y))
+        old_clip = surface.get_clip()
+        _set_scaled_clip(surface, map_rect)
+        any_tile = False
+        visible_failures = 0
+        missing_tiles: list[tuple[float, tuple[int, int, int]]] = []
+        for tile_y in range(first_y, last_y + 1):
+            for unwrapped_x in range(first_x, last_x + 1):
+                tile_x = unwrapped_x % tile_count
+                key = (zoom, tile_x, tile_y)
+                left = round(map_rect.centerx + (unwrapped_x - center_x) * WORLD_TILE_SIZE)
+                top = round(map_rect.centery + (tile_y - center_y) * WORLD_TILE_SIZE)
+                target = pygame.Rect(left, top, WORLD_TILE_SIZE + 1, WORLD_TILE_SIZE + 1)
+                tile_surface = self.world_tiles.get(key)
+                if tile_surface is None:
+                    if self.world_tile_failures.get(key, 0.0) <= time.monotonic():
+                        distance = (unwrapped_x + 0.5 - center_x) ** 2 + (tile_y + 0.5 - center_y) ** 2
+                        missing_tiles.append((distance, key))
+                    else:
+                        visible_failures += 1
+                    continue
+                any_tile = True
+                rendered_tile = self.world_tile_render_cache.get(key)
+                if rendered_tile is None:
+                    physical_size = max(1, round(WORLD_TILE_SIZE * self.render_scale))
+                    rendered_tile = pygame.transform.smoothscale(tile_surface, (physical_size, physical_size))
+                    self.world_tile_render_cache[key] = rendered_tile
+                _scaled_blit(surface, rendered_tile, target, source_is_native=True)
+        for _, key in sorted(missing_tiles):
+            self.tile_worker.request(key)
+        selected_x, selected_y = _tile_xy(self.selected_latitude, self.selected_longitude, zoom)
+        offset_x = (selected_x - center_x + tile_count / 2) % tile_count - tile_count / 2
+        selected_point = (
+            round(map_rect.centerx + offset_x * WORLD_TILE_SIZE),
+            round(map_rect.centery + (selected_y - center_y) * WORLD_TILE_SIZE),
+        )
+        radius_x = max(4, round(self.radius_km * 1000 / (111_320 * max(0.05, math.cos(math.radians(self.selected_latitude)))) * tile_count * WORLD_TILE_SIZE / 360))
+        radius_y = max(4, round(self.radius_km * 1000 / 111_320 * tile_count * WORLD_TILE_SIZE / (360 * max(0.05, math.cos(math.radians(self.selected_latitude))))))
+        circle_rect = pygame.Rect(
+            selected_point[0] - radius_x,
+            selected_point[1] - radius_y,
+            radius_x * 2,
+            radius_y * 2,
+        )
+        draw.ellipse(surface, LIME, circle_rect, 2)
+        draw.circle(surface, TEXT, selected_point, 4)
+        draw.line(surface, LIME, (selected_point[0] - 12, selected_point[1]), (selected_point[0] + 12, selected_point[1]), 2)
+        draw.line(surface, LIME, (selected_point[0], selected_point[1] - 12), (selected_point[0], selected_point[1] + 12), 2)
+        surface.set_clip(old_clip)
+        draw.rect(surface, LINE, map_rect, 1)
+        self._button(surface, "map_zoom_in", pygame.Rect(map_rect.right - 54, map_rect.y + 18, 36, 32), "+", accent=CYAN)
+        self._button(surface, "map_zoom_out", pygame.Rect(map_rect.right - 54, map_rect.y + 58, 36, 32), "−", accent=CYAN)
+        attribution = "© OpenStreetMap contributors  ·  CARTO"
+        self._text(surface, attribution, map_rect.x + 14, map_rect.bottom - 20, TEXT if any_tile else MUTED, self.small)
+        if not any_tile:
+            map_status = "WORLD MAP TILES UNAVAILABLE · CHECK CONNECTION" if visible_failures else "LOADING WORLD MAP  ·  MAP REMAINS AVAILABLE FROM CACHE OFFLINE"
+            self._text(surface, map_status, map_rect.x + 22, map_rect.y + 20, AMBER if visible_failures else MUTED, self.small)
+        elif visible_failures:
+            self._text(surface, "SOME MAP TILES UNAVAILABLE", map_rect.x + 22, map_rect.y + 20, AMBER, self.small)
+        surface.set_clip(old_clip)
 
     def _draw_area_select(self) -> None:
         surface = self.canvas
@@ -1736,24 +2504,24 @@ class Deadgrid:
         area_rect = pygame.Rect(center_point[0] - radius_x, center_point[1] - radius_y, radius_x * 2, radius_y * 2)
         shade = pygame.Surface(map_rect.size, pygame.SRCALPHA)
         shade.fill((8, 15, 13, 104))
-        pygame.draw.ellipse(shade, (0, 0, 0, 0), area_rect.move(-map_rect.x, -map_rect.y))
-        surface.blit(shade, map_rect.topleft)
+        draw.ellipse(shade, (0, 0, 0, 0), area_rect.move(-map_rect.x, -map_rect.y))
+        _scaled_blit(surface, shade, map_rect.topleft)
         previous_clip = surface.get_clip()
-        surface.set_clip(map_rect)
-        pygame.draw.ellipse(surface, (20, 28, 25), area_rect, 9)
-        pygame.draw.ellipse(surface, LIME, area_rect, 3)
-        pygame.draw.circle(surface, RED, center_point, 7)
-        pygame.draw.line(surface, RED, (center_point[0] - 16, center_point[1]), (center_point[0] + 16, center_point[1]), 2)
-        pygame.draw.line(surface, RED, (center_point[0], center_point[1] - 16), (center_point[0], center_point[1] + 16), 2)
+        _set_scaled_clip(surface, map_rect)
+        draw.ellipse(surface, (20, 28, 25), area_rect, 9)
+        draw.ellipse(surface, LIME, area_rect, 3)
+        draw.circle(surface, RED, center_point, 7)
+        draw.line(surface, RED, (center_point[0] - 16, center_point[1]), (center_point[0] + 16, center_point[1]), 2)
+        draw.line(surface, RED, (center_point[0], center_point[1] - 16), (center_point[0], center_point[1] + 16), 2)
         surface.set_clip(previous_clip)
-        pygame.draw.rect(surface, PANEL, (40, 718, 1280, 72), border_radius=4)
+        draw.rect(surface, PANEL, (40, 718, 1280, 72), border_radius=4)
         self._text(surface, f"AREA RADIUS  {self.radius_km:.2f} KM", 58, 730, CYAN, self.small)
         radius_slider = pygame.Rect(58, 755, 435, 14)
         self.hit_targets["area_radius_slider"] = radius_slider
-        pygame.draw.rect(surface, LINE, (radius_slider.x, radius_slider.y + 5, radius_slider.w, 4), border_radius=2)
+        draw.rect(surface, LINE, (radius_slider.x, radius_slider.y + 5, radius_slider.w, 4), border_radius=2)
         ratio = (self.radius_km - 0.35) / (2.0 - 0.35)
-        pygame.draw.rect(surface, LIME, (radius_slider.x, radius_slider.y + 5, int(radius_slider.w * ratio), 4), border_radius=2)
-        pygame.draw.circle(surface, TEXT, (int(radius_slider.x + radius_slider.w * ratio), radius_slider.centery), 7)
+        draw.rect(surface, LIME, (radius_slider.x, radius_slider.y + 5, int(radius_slider.w * ratio), 4), border_radius=2)
+        draw.circle(surface, TEXT, (int(radius_slider.x + radius_slider.w * ratio), radius_slider.centery), 7)
         self._text(surface, f"{math.pi * self.radius_km ** 2:.1f} KM²  /  SELECTED FOOTPRINT", 520, 738, TEXT, self.small)
         self._button(surface, "zoom_out", pygame.Rect(770, 730, 44, 42), "−", accent=CYAN)
         self._text(surface, f"{self.area_zoom:.1f}×", 824, 744, TEXT, self.bold)
@@ -1772,8 +2540,8 @@ class Deadgrid:
         self._text(surface, "SCENARIO NAME", 68, 211, CYAN, self.small)
         name_rect = pygame.Rect(68, 232, 530, 47)
         self.hit_targets["scenario_name"] = name_rect
-        pygame.draw.rect(surface, PANEL_HI if self.scenario_name_active else PANEL, name_rect, border_radius=5)
-        pygame.draw.rect(surface, LIME if self.scenario_name_active else LINE, name_rect, 1, border_radius=5)
+        draw.rect(surface, PANEL_HI if self.scenario_name_active else PANEL, name_rect, border_radius=5)
+        draw.rect(surface, LIME if self.scenario_name_active else LINE, name_rect, 1, border_radius=5)
         self._text(surface, self.scenario_name + ("|" if self.scenario_name_active and int(time.time() * 2) % 2 else ""), name_rect.x + 13, name_rect.y + 14, TEXT)
         self._text(surface, f"AREA  /  {self.place_input[:24]}  /  {self.radius_km:.2f} KM RADIUS", 640, 248, MUTED, self.small)
 
@@ -1819,7 +2587,7 @@ class Deadgrid:
             radius_y = max(1, round(effect["radius"] * (0.45 + progress * 0.7) * map_rect.h / WORLD_H))
             color = AMBER if effect["kind"] == "strike" else CYAN
             center = self._map_point(effect["x"] / WORLD_W, effect["y"] / WORLD_H)
-            pygame.draw.ellipse(surface, color, pygame.Rect(center[0] - radius_x, center[1] - radius_y, radius_x * 2, radius_y * 2), 2)
+            draw.ellipse(surface, color, pygame.Rect(center[0] - radius_x, center[1] - radius_y, radius_x * 2, radius_y * 2), 2)
 
         # Deployed assets are intentionally visible over crowds and streets.
         for structure in self.units:
@@ -1827,19 +2595,19 @@ class Deadgrid:
             kind = structure["kind"]
             data = UNITS[kind]
             if kind == "BARRICADE":
-                pygame.draw.circle(surface, (165, 135, 83), center, 10, 2)
-                pygame.draw.line(surface, data["color"], (center[0] - 8, center[1] - 5), (center[0] + 8, center[1] + 5), 3)
+                draw.circle(surface, (165, 135, 83), center, 10, 2)
+                draw.line(surface, data["color"], (center[0] - 8, center[1] - 5), (center[0] + 8, center[1] + 5), 3)
             elif kind in ("EVAC STATION", "SAFE ZONE"):
-                pygame.draw.circle(surface, data["color"], center, 9, 2)
-                pygame.draw.line(surface, data["color"], (center[0] - 4, center[1]), (center[0] + 4, center[1]), 2)
-                pygame.draw.line(surface, data["color"], (center[0], center[1] - 4), (center[0], center[1] + 4), 2)
+                draw.circle(surface, data["color"], center, 9, 2)
+                draw.line(surface, data["color"], (center[0] - 4, center[1]), (center[0] + 4, center[1]), 2)
+                draw.line(surface, data["color"], (center[0], center[1] - 4), (center[0], center[1] + 4), 2)
             elif kind == "SUPPLY DROP":
-                pygame.draw.rect(surface, data["color"], pygame.Rect(center[0] - 7, center[1] - 7, 14, 14), border_radius=2)
-                pygame.draw.line(surface, INK, (center[0] - 4, center[1]), (center[0] + 4, center[1]), 2)
+                draw.rect(surface, data["color"], pygame.Rect(center[0] - 7, center[1] - 7, 14, 14), border_radius=2)
+                draw.line(surface, INK, (center[0] - 4, center[1]), (center[0] + 4, center[1]), 2)
             else:
-                pygame.draw.circle(surface, (14, 25, 25), center, 11)
-                pygame.draw.circle(surface, data["color"], center, 8, 2)
-                pygame.draw.circle(surface, data["color"], center, 3)
+                draw.circle(surface, (14, 25, 25), center, 11)
+                draw.circle(surface, data["color"], center, 8, 2)
+                draw.circle(surface, data["color"], center, 3)
 
         # Route highlights, selection, and labels form the top map layer.
         if self.screen_name == "active" and len(self.evac_next_nodes) == len(self.road_nodes):
@@ -1856,18 +2624,18 @@ class Deadgrid:
                     if node < 0:
                         break
                 if len(route) > 1:
-                    pygame.draw.lines(surface, CYAN, False, route, 2)
+                    draw.lines(surface, CYAN, False, route, 2)
 
         infection = self._map_point(*self.infection_origin)
-        pygame.draw.circle(surface, (214, 77, 70), infection, 47, 1)
-        pygame.draw.circle(surface, (214, 77, 70), infection, 24, 1)
-        pygame.draw.circle(surface, RED, infection, 4)
+        draw.circle(surface, (214, 77, 70), infection, 47, 1)
+        draw.circle(surface, (214, 77, 70), infection, 24, 1)
+        draw.circle(surface, RED, infection, 4)
         if self.moving_unit in self.units:
             center = self._map_point(self.moving_unit["x"] / WORLD_W, self.moving_unit["y"] / WORLD_H)
             radius_x = max(1, round(self.moving_unit["range"] * map_rect.w / WORLD_W))
             radius_y = max(1, round(self.moving_unit["range"] * map_rect.h / WORLD_H))
-            pygame.draw.ellipse(surface, UNITS[self.moving_unit["kind"]]["color"], pygame.Rect(center[0] - radius_x, center[1] - radius_y, radius_x * 2, radius_y * 2), 1)
-            pygame.draw.circle(surface, TEXT, center, 14, 1)
+            draw.ellipse(surface, UNITS[self.moving_unit["kind"]]["color"], pygame.Rect(center[0] - radius_x, center[1] - radius_y, radius_x * 2, radius_y * 2), 1)
+            draw.circle(surface, TEXT, center, 14, 1)
         self._text(surface, "PATIENT ZERO", infection[0] + 10, infection[1] - 20, RED, self.small)
         if intel_labels:
             title = "INTEL  /  " + "  ·  ".join(intel_labels)
@@ -1881,18 +2649,18 @@ class Deadgrid:
                     start = self.barricade_drag_start
                     start_point = self._map_point(start[0] / WORLD_W, start[1] / WORLD_H)
                     end_point = self._map_point(end[0] / WORLD_W, end[1] / WORLD_H)
-                    pygame.draw.line(surface, (34, 42, 39), start_point, end_point, 9)
-                    pygame.draw.line(surface, AMBER, start_point, end_point, 4)
+                    draw.line(surface, (34, 42, 39), start_point, end_point, 9)
+                    draw.line(surface, AMBER, start_point, end_point, 4)
                     length = math.dist(start, end)
                     count = max(1, math.ceil(length / 48.0) + (1 if length >= 18.0 else 0))
                     for index in range(count):
                         fraction = index / max(1, count - 1)
                         post = (round(start_point[0] + (end_point[0] - start_point[0]) * fraction), round(start_point[1] + (end_point[1] - start_point[1]) * fraction))
-                        pygame.draw.circle(surface, AMBER, post, 5, 2)
+                        draw.circle(surface, AMBER, post, 5, 2)
                     self._text(surface, f"{count} POSTS  ·  ${count * UNITS['BARRICADE']['cost']}", min(start_point[0], end_point[0]) + 8, min(start_point[1], end_point[1]) - 18, AMBER, self.small)
                 else:
-                    pygame.draw.circle(surface, AMBER, cursor, 7, 2)
-                    pygame.draw.line(surface, AMBER, (cursor[0] - 8, cursor[1]), (cursor[0] + 8, cursor[1]), 2)
+                    draw.circle(surface, AMBER, cursor, 7, 2)
+                    draw.line(surface, AMBER, (cursor[0] - 8, cursor[1]), (cursor[0] + 8, cursor[1]), 2)
             else:
                 if self.target_mode == "deploy":
                     radius_world = UNITS[self.selected_unit]["range"]
@@ -1904,10 +2672,10 @@ class Deadgrid:
                     radius_world = 30
                 radius_x = max(1, round(radius_world * map_rect.w / WORLD_W))
                 radius_y = max(1, round(radius_world * map_rect.h / WORLD_H))
-                pygame.draw.ellipse(surface, color, pygame.Rect(cursor[0] - radius_x, cursor[1] - radius_y, radius_x * 2, radius_y * 2), 1)
-                pygame.draw.circle(surface, color, cursor, 5, 2)
-                pygame.draw.line(surface, color, (cursor[0] - 12, cursor[1]), (cursor[0] + 12, cursor[1]), 1)
-                pygame.draw.line(surface, color, (cursor[0], cursor[1] - 12), (cursor[0], cursor[1] + 12), 1)
+                draw.ellipse(surface, color, pygame.Rect(cursor[0] - radius_x, cursor[1] - radius_y, radius_x * 2, radius_y * 2), 1)
+                draw.circle(surface, color, cursor, 5, 2)
+                draw.line(surface, color, (cursor[0] - 12, cursor[1]), (cursor[0] + 12, cursor[1]), 1)
+                draw.line(surface, color, (cursor[0], cursor[1] - 12), (cursor[0], cursor[1] + 12), 1)
 
     def _draw_intelligence(self, surface: pygame.Surface) -> list[str]:
         labels = {"risk": "INFECTION RISK", "horde": "HORDE DENSITY", "exposed": "EXPOSED CIVILIANS", "survivors": "EST. SURVIVORS"}
@@ -1915,7 +2683,7 @@ class Deadgrid:
         map_rect = self._map_content_rect()
         for mode, enabled in self.intel_modes.items():
             if enabled and mode in self.intel_layers:
-                surface.blit(self.intel_layers[mode], map_rect.topleft)
+                _scaled_blit(surface, self.intel_layers[mode], map_rect.topleft, source_is_native=True)
                 shown.append(labels[mode])
         return shown
 
@@ -1930,28 +2698,28 @@ class Deadgrid:
         self.hit_targets = {}
         self._header(surface, f"LIVE SIMULATION  /  {self.simulation_status.upper()}" if active else "DEPLOYMENT PHASE")
         # Left: command picture and incident telemetry.
-        pygame.draw.rect(surface, PANEL, (20, 100, 236, 664), border_radius=5)
+        draw.rect(surface, PANEL, (20, 100, 236, 664), border_radius=5)
         self._text(surface, "INCIDENT BRIEF", 36, 118, CYAN, self.small)
         self._text(surface, self.city.name[:25].upper(), 36, 142, TEXT, self.bold)
         self._text(surface, f"MAP SOURCE  /  {self.city.source}", 36, 168, MUTED, self.small)
-        pygame.draw.line(surface, LINE, (36, 193), (240, 193), 1)
+        draw.line(surface, LINE, (36, 193), (240, 193), 1)
         self._text(surface, "ESTIMATED RESIDENTS", 36, 209, MUTED, self.small)
         self._text(surface, f"~{self.city.population:,}", 36, 231, TEXT, self.large)
         self._text(surface, f"MAX {self.people_per_agent:,} PEOPLE / AGENT", 36, 269, MUTED, self.small)
-        pygame.draw.line(surface, LINE, (36, 290), (240, 290), 1)
+        draw.line(surface, LINE, (36, 290), (240, 290), 1)
         self._text(surface, "INITIAL INFECTED", 36, 302, RED, self.small)
         self._text(surface, f"{self.initial_infected_agents:,} AGENTS (~{self.initial_infected_population:,} PEOPLE)", 36, 322, TEXT, self.small)
         self._text(surface, "RESCUED POPULATION", 36, 350, LIME, self.small)
         self._text(surface, f"{self.rescued:,}", 36, 371, LIME, self.large)
         self._text(surface, "CASUALTIES", 148, 382, RED, self.small)
         self._text(surface, f"{self.casualties:,}", 148, 402, RED, self.bold)
-        pygame.draw.line(surface, LINE, (36, 430), (240, 430), 1)
+        draw.line(surface, LINE, (36, 430), (240, 430), 1)
         self._text(surface, "THREAT TRACKER", 36, 441, AMBER, self.small)
         self._text(surface, f"HOSTILES     {len(self.zombies['x']) + self.infected_count:,}", 36, 465, RED, self.bold)
         self._text(surface, f"INCUBATING   {self.infected_count:,}", 36, 488, MUTED, self.small)
         self._text(surface, f"RESOURCES    ${self.budget:,}", 36, 511, LIME, self.bold)
         if active:
-            pygame.draw.line(surface, LINE, (36, 540), (240, 540), 1)
+            draw.line(surface, LINE, (36, 540), (240, 540), 1)
             self._text(surface, "CONTAINMENT", 36, 551, CYAN, self.small)
             rate = len(self.zombies["x"]) / max(1, self.simulation_time / 60)
             self._text(surface, f"OUTBREAK RATE   {rate:0.1f}/MIN", 36, 575, AMBER, self.small)
@@ -1965,7 +2733,7 @@ class Deadgrid:
             self._button(surface, "launch", pygame.Rect(36, 690, 204, 48), "BEGIN OPERATION  →", accent=LIME, subtitle="PATIENT ZERO IS ACTIVE")
         # Map and source bar.
         self._draw_map_overlay(surface)
-        pygame.draw.rect(surface, PANEL, (MAP_RECT.x, MAP_RECT.bottom, MAP_RECT.w, 27))
+        draw.rect(surface, PANEL, (MAP_RECT.x, MAP_RECT.bottom, MAP_RECT.w, 27))
         self._text(surface, f"{self.city.name.upper()}   ·   {self.city.source}   ·   © OPENSTREETMAP CONTRIBUTORS / OVERTURE MAPS", MAP_RECT.x + 12, MAP_RECT.bottom + 7, (118, 140, 128), self.small)
         if self.target_mode == "deploy":
             instruction = "DRAG TO LAY WALL · RELEASE TO PLACE" if self.selected_unit == "BARRICADE" and self.barricade_drag_start else ("BARRICADE · CLICK OR DRAG TO PLACE" if self.selected_unit == "BARRICADE" else "PLACEMENT PREVIEW · CLICK TO CONFIRM")
@@ -1981,7 +2749,7 @@ class Deadgrid:
             label = "SET PERIMETER  /  CLICK TO DEPLOY" if not active else ("PAUSED  ·  SPACE TO RESUME" if self.phase_time == -1 else "LIVE FIELD VIEW  /  RIGHT-CLICK TO CANCEL")
             self._text(surface, label, MAP_RECT.x + 15, MAP_RECT.y + 13, LIME if not active else CYAN, self.small)
         # Right: deployable forces and support.
-        pygame.draw.rect(surface, PANEL, (1092, 100, 248, 664), border_radius=5)
+        draw.rect(surface, PANEL, (1092, 100, 248, 664), border_radius=5)
         self._text(surface, "DEPLOYMENT", 1108, 118, CYAN, self.small)
         self._text(surface, "GROUND ASSETS", 1108, 146, MUTED, self.small)
         unit_order = list(UNITS)
@@ -1991,10 +2759,10 @@ class Deadgrid:
             active_tool = self.selected_unit == kind and self.target_mode in (None, "deploy")
             self._button(surface, f"unit_{kind}", pygame.Rect(1108, y, 216, 40), kind, active=active_tool, accent=item["color"], subtitle=f"${item['cost']}  /  {item['description']}")
             if active_tool:
-                pygame.draw.rect(surface, item["color"], pygame.Rect(1104, y - 2, 4, 44), border_radius=2)
+                draw.rect(surface, item["color"], pygame.Rect(1104, y - 2, 4, 44), border_radius=2)
             if index < 6:
                 self._text(surface, str(index + 1), 1310, y + 13, MUTED, self.small)
-        pygame.draw.line(surface, LINE, (1108, 516), (1324, 516), 1)
+        draw.line(surface, LINE, (1108, 516), (1324, 516), 1)
         self._text(surface, "AIR SUPPORT", 1108, 531, MUTED, self.small)
         strike_cost = 180
         gunship_cost = 290
@@ -2010,13 +2778,13 @@ class Deadgrid:
         for index, (mode, label) in enumerate(overlay_names):
             self._button(surface, f"intel_{mode}", pygame.Rect(1108 + index * 54, 739, 52, 24), label, active=self.intel_modes[mode], accent={"risk": RED, "horde": AMBER, "exposed": (242, 187, 79), "survivors": CYAN}[mode])
         if self.message_timer > 0:
-            pygame.draw.rect(surface, (15, 24, 24), (292, 715, 764, 25), border_radius=3)
+            draw.rect(surface, (15, 24, 24), (292, 715, 764, 25), border_radius=3)
             self._text(surface, self.message[:91], 302, 721, AMBER if "FAILED" in self.message else TEXT, self.small)
         if self.screen_name == "deployment" and self.mouse and self._map_content_rect().collidepoint(self.mouse):
             cursor = self.mouse
             color = UNITS[self.selected_unit]["color"]
-            pygame.draw.circle(surface, color, cursor, 10, 1)
-            pygame.draw.line(surface, color, (cursor[0] - 15, cursor[1]), (cursor[0] + 15, cursor[1]), 1)
+            draw.circle(surface, color, cursor, 10, 1)
+            draw.line(surface, color, (cursor[0] - 15, cursor[1]), (cursor[0] + 15, cursor[1]), 1)
         self._draw_tooltip(surface)
 
     def _draw_analysis(self) -> None:
@@ -2029,8 +2797,8 @@ class Deadgrid:
 
         ledger = self._population_ledger()
         ledger_rect = pygame.Rect(45, 153, 380, 390)
-        pygame.draw.rect(self.canvas, PANEL, ledger_rect, border_radius=4)
-        pygame.draw.rect(self.canvas, LINE, ledger_rect, 1, border_radius=4)
+        draw.rect(self.canvas, PANEL, ledger_rect, border_radius=4)
+        draw.rect(self.canvas, LINE, ledger_rect, 1, border_radius=4)
         self._text(self.canvas, "POPULATION LEDGER", 64, 169, CYAN, self.bold)
         rows = (
             ("STARTING RESIDENTS", ledger["starting"], TEXT),
@@ -2047,7 +2815,7 @@ class Deadgrid:
             value_width = self.bold.size(value_text)[0]
             self._text(self.canvas, value_text, ledger_rect.right - 18 - value_width, y - 2, color, self.bold)
             if index < len(rows) - 1:
-                pygame.draw.line(self.canvas, LINE, (64, y + 30), (ledger_rect.right - 18, y + 30), 1)
+                draw.line(self.canvas, LINE, (64, y + 30), (ledger_rect.right - 18, y + 30), 1)
         reconciles = ledger["accounted"] == ledger["starting"]
         balance_text = "RECONCILED · 0 UNASSIGNED" if reconciles else f"UNRECONCILED · {ledger['starting'] - ledger['accounted']:,}"
         self._text(self.canvas, balance_text, 64, 493, LIME if reconciles else RED, self.small)
@@ -2065,23 +2833,23 @@ class Deadgrid:
             for x, y, population in event["locations"]:
                 point = (int(content_rect.x + x * content_rect.w), int(content_rect.y + y * content_rect.h))
                 radius = 5 if event["kind"] == "outbreak" else min(20, 7 + int(math.log10(max(1, population)) * 2))
-                pygame.draw.circle(self.canvas, color, point, radius, 2)
-                pygame.draw.circle(self.canvas, color, point, 3)
+                draw.circle(self.canvas, color, point, radius, 2)
+                draw.circle(self.canvas, color, point, 3)
         legend_items = ((RED, "OUTBREAK"), (AMBER, "ROUTE FAILURE"), ((234, 130, 76), "CRITICAL SPREAD"), ((235, 75, 68), "COLLAPSE"), (LIME, "EVACUATED"))
         legend_x = 465
         for color, label in legend_items:
-            pygame.draw.circle(self.canvas, color, (legend_x + 5, 559), 4)
+            draw.circle(self.canvas, color, (legend_x + 5, 559), 4)
             self._text(self.canvas, label, legend_x + 15, 553, MUTED, self.small)
             legend_x += 151
 
         self._text(self.canvas, "CONTAINMENT TIMELINE", 50, 580, CYAN, self.small)
         events = self.containment_timeline[-5:]
         if events:
-            pygame.draw.line(self.canvas, LINE, (78, 605), (78, 693), 1)
+            draw.line(self.canvas, LINE, (78, 605), (78, 693), 1)
             for index, event in enumerate(events):
                 y = 600 + index * 19
                 color = marker_colors.get(event["kind"], MUTED)
-                pygame.draw.circle(self.canvas, color, (78, y + 5), 3)
+                draw.circle(self.canvas, color, (78, y + 5), 3)
                 elapsed = int(event["time"])
                 self._text(self.canvas, f"T+{elapsed // 60:02}:{elapsed % 60:02}", 94, y, MUTED, self.small)
                 self._text(self.canvas, event["label"].upper(), 170, y, TEXT, self.small)
@@ -2323,18 +3091,61 @@ class Deadgrid:
 
     def _update(self, dt: float) -> None:
         self.message_timer = max(0, self.message_timer - dt)
+        while True:
+            try:
+                query, results, error = self.worker.place_results.get_nowait()
+            except queue.Empty:
+                break
+            if query == self.search_query:
+                self.search_loading = False
+            if query != self.place_input.strip() or query != self.search_query:
+                continue
+            self.search_results = results
+            if error:
+                self._notify(error)
+            elif not results:
+                self._notify("NO PLACES FOUND · TRY A CITY OR REGION")
+            else:
+                self._notify(f"{len(results)} PLACE RESULTS · SELECT A LOCATION")
+        while True:
+            try:
+                key, tile_data, error = self.tile_worker.results.get_nowait()
+            except queue.Empty:
+                break
+            self.tile_worker.complete(key)
+            if error or tile_data is None:
+                self.world_tile_failures[key] = time.monotonic() + 30.0
+                continue
+            try:
+                tile_surface = pygame.image.load(io.BytesIO(tile_data)).convert()
+            except pygame.error:
+                self.world_tile_failures[key] = time.monotonic() + 60.0
+                continue
+            self.world_tile_failures.pop(key, None)
+            self.world_tiles[key] = tile_surface
+            if len(self.world_tiles) > 120:
+                expired = next(iter(self.world_tiles))
+                self.world_tiles.pop(expired)
+                self.world_tile_render_cache.pop(expired, None)
         if self.loading:
             try:
                 city = self.worker.results.get_nowait()
                 self.loading = False
+                loading_operation = self.loading_operation
+                self.loading_operation = False
                 self.city = city
                 self.city_surface_cache.clear()
-                self.screen_name = "area_select"
-                self.area_selection = (0.5, 0.5)
-                self.area_view_center = (0.5, 0.5)
-                self.area_zoom = 1.3
-                self._limit_area_selection()
-                self._notify("MAP READY · CLICK THE CENTER OF YOUR OPERATION AREA", 6.0)
+                if loading_operation:
+                    selected_city = self._select_city_area(city, (0.5, 0.5), self.radius_km)
+                    self._begin_operation(selected_city)
+                    self._notify("OPERATION READY · DEPLOY YOUR RESPONSE TEAMS", 6.0)
+                else:
+                    self.screen_name = "area_select"
+                    self.area_selection = (0.5, 0.5)
+                    self.area_view_center = (0.5, 0.5)
+                    self.area_zoom = 1.3
+                    self._limit_area_selection()
+                    self._notify("MAP READY · CLICK THE CENTER OF YOUR OPERATION AREA", 6.0)
             except queue.Empty:
                 pass
         if self.screen_name != "active" or self.phase_time < 0:
@@ -2402,8 +3213,12 @@ class Deadgrid:
             crowd["dx"][turning] = np.random.uniform(-1, 1, turning_count)
             crowd["dy"][turning] = np.random.uniform(-1, 1, turning_count)
         wandering = (~crowd["evacuating"]) & (~crowd["safe"])
-        crowd["x"][wandering] = np.clip(crowd["x"][wandering] + crowd["dx"][wandering] * (4.0 * dt), 8, WORLD_W - 8)
-        crowd["y"][wandering] = np.clip(crowd["y"][wandering] + crowd["dy"][wandering] * (4.0 * dt), 8, WORLD_H - 8)
+        self._move_with_collision(
+            crowd["x"],
+            crowd["y"],
+            np.where(wandering, crowd["dx"] * (4.0 * dt), 0.0),
+            np.where(wandering, crowd["dy"] * (4.0 * dt), 0.0),
+        )
         self._move_evacuating(dt)
         crowd = self.civilians
         count = len(crowd["x"])
@@ -2452,8 +3267,12 @@ class Deadgrid:
             zombie_cell_x = np.clip((zombies["x"] * (grid_w / WORLD_W)).astype(np.int32), 0, grid_w - 1)
             zombie_cell_y = np.clip((zombies["y"] * (grid_h / WORLD_H)).astype(np.int32), 0, grid_h - 1)
             speed *= self._barricade_slow_grid[zombie_cell_y, zombie_cell_x]
-            zombies["x"] = np.clip(zombies["x"] + direction_x / distance * speed * dt, 2, WORLD_W - 2)
-            zombies["y"] = np.clip(zombies["y"] + direction_y / distance * speed * dt, 2, WORLD_H - 2)
+            self._move_with_collision(
+                zombies["x"],
+                zombies["y"],
+                direction_x / distance * speed * dt,
+                direction_y / distance * speed * dt,
+            )
 
             zombie_cell_x = np.clip((zombies["x"] * (grid_w / WORLD_W)).astype(np.int32), 0, grid_w - 1)
             zombie_cell_y = np.clip((zombies["y"] * (grid_h / WORLD_H)).astype(np.int32), 0, grid_h - 1)
@@ -2484,10 +3303,11 @@ class Deadgrid:
             flee_direction_y = flee_y[cell_y, cell_x]
             flee_distance = np.maximum(0.001, np.hypot(flee_direction_x, flee_direction_y))
             panic = (crowd["status"] == 0) & (~crowd["safe"]) & (~following_evac_route) & (sampled_risk > 0.2) & (flee_distance > 0.01)
-            crowd["x"][panic] += flee_direction_x[panic] / flee_distance[panic] * (30.0 * dt)
-            crowd["y"][panic] += flee_direction_y[panic] / flee_distance[panic] * (30.0 * dt)
-            crowd["x"] = np.clip(crowd["x"], 8, WORLD_W - 8)
-            crowd["y"] = np.clip(crowd["y"], 8, WORLD_H - 8)
+            panic_dx = np.zeros_like(crowd["x"])
+            panic_dy = np.zeros_like(crowd["y"])
+            panic_dx[panic] = flee_direction_x[panic] / flee_distance[panic] * (30.0 * dt)
+            panic_dy[panic] = flee_direction_y[panic] / flee_distance[panic] * (30.0 * dt)
+            self._move_with_collision(crowd["x"], crowd["y"], panic_dx, panic_dy)
             cell_x = np.clip((crowd["x"] * (grid_w / WORLD_W)).astype(np.int32), 0, grid_w - 1)
             cell_y = np.clip((crowd["y"] * (grid_h / WORLD_H)).astype(np.int32), 0, grid_h - 1)
             sampled_pressure = pressure[cell_y, cell_x]
@@ -2526,6 +3346,7 @@ class Deadgrid:
                 "route_node": np.concatenate((zombies.get("route_node", np.empty(0, dtype=np.int32)), self._snap_agents_to_roads(converted_x, converted_y))),
                 "route_narrow": np.concatenate((zombies.get("route_narrow", np.zeros(len(zombies["x"]), dtype=bool)), np.zeros(converted_count, dtype=bool))),
             }
+            self._resolve_blocked_positions(self.zombies["x"], self.zombies["y"])
         self.infected_count = int(np.count_nonzero(self.civilians["status"] == 1))
         remaining_x = np.clip((self.civilians["x"] * (grid_w / WORLD_W)).astype(np.int32), 0, grid_w - 1)
         remaining_y = np.clip((self.civilians["y"] * (grid_h / WORLD_H)).astype(np.int32), 0, grid_h - 1)
@@ -2547,6 +3368,11 @@ class Deadgrid:
             if self.screen_name == "area_select":
                 self.area_pan_drag = True
                 self.area_pan_last = point
+                return
+            if self.screen_name == "menu" and self._world_map_rect().collidepoint(point):
+                self.world_pan_drag = True
+                self.world_pan_moved = False
+                self.world_pan_last = point
                 return
             self.target_mode = None
             self.barricade_drag_start = None
@@ -2577,24 +3403,42 @@ class Deadgrid:
         elif self.screen_name == "menu":
             if self.hit_targets.get("place_input", pygame.Rect(0, 0, 0, 0)).collidepoint(point):
                 self.input_active = True
+            elif self.hit_targets.get("search_places", pygame.Rect(0, 0, 0, 0)).collidepoint(point):
+                self._search_places()
+            elif self.hit_targets.get("start_operation", pygame.Rect(0, 0, 0, 0)).collidepoint(point):
+                self._start_operation_from_world_map()
+            elif self.hit_targets.get("map_zoom_in", pygame.Rect(0, 0, 0, 0)).collidepoint(point):
+                self._zoom_world(1, self._world_map_rect().center)
+            elif self.hit_targets.get("map_zoom_out", pygame.Rect(0, 0, 0, 0)).collidepoint(point):
+                self._zoom_world(-1, self._world_map_rect().center)
             elif self.hit_targets.get("radius_slider", pygame.Rect(0, 0, 0, 0)).collidepoint(point):
                 self.dragging_radius = True
                 self._set_radius_from_x(point[0])
             elif self.hit_targets.get("config", pygame.Rect(0, 0, 0, 0)).collidepoint(point):
                 self.screen_name = "config"
-            elif "build_plan" in self.hit_targets and self.hit_targets["build_plan"].collidepoint(point):
-                self._request_map()
             elif "overture" in self.hit_targets and self.hit_targets["overture"].collidepoint(point):
                 self.use_overture = not self.use_overture
             for percentage in (0.5, 1.0, 2.0, 5.0):
                 key = f"infect_{percentage:g}%"
                 if key in self.hit_targets and self.hit_targets[key].collidepoint(point):
                     self.initial_infection_percent = percentage
+            for index, result in enumerate(self.search_results[:5]):
+                key = f"place_result_{index}"
+                if self.hit_targets.get(key, pygame.Rect(0, 0, 0, 0)).collidepoint(point):
+                    self._focus_place(result)
             for index in range(len(PRESETS)):
                 key = f"preset_{index}"
                 if key in self.hit_targets and self.hit_targets[key].collidepoint(point):
                     self.place_input = PRESETS[index]
-                    self._request_map(PRESETS[index])
+                    self.input_active = False
+                    self._search_places()
+            if self._world_map_rect().collidepoint(point) and not any(
+                self.hit_targets.get(key, pygame.Rect(0, 0, 0, 0)).collidepoint(point)
+                for key in ("map_zoom_in", "map_zoom_out")
+            ):
+                self.world_pan_drag = True
+                self.world_pan_moved = False
+                self.world_pan_last = point
         elif self.screen_name == "config":
             if self.hit_targets.get("scenario_name", pygame.Rect(0, 0, 0, 0)).collidepoint(point):
                 self.scenario_name_active = True
@@ -2734,6 +3578,13 @@ class Deadgrid:
             self.mouse = self._screen_position(event)
             if self.screen_name == "menu" and getattr(self, "dragging_radius", False) and getattr(event, "buttons", (False,))[0]:
                 self._set_radius_from_x(self.mouse[0])
+            if self.screen_name == "menu" and self.world_pan_drag and any(getattr(event, "buttons", ())):
+                dx = self.mouse[0] - self.world_pan_last[0]
+                dy = self.mouse[1] - self.world_pan_last[1]
+                if abs(dx) + abs(dy) >= 2:
+                    self.world_pan_moved = True
+                    self._pan_world(dx, dy)
+                    self.world_pan_last = self.mouse
             elif self.screen_name == "area_select" and self.dragging_radius and getattr(event, "buttons", (False,))[0]:
                 self._set_area_radius_from_x(self.mouse[0])
             if self.screen_name == "area_select" and self.area_pan_drag and getattr(event, "buttons", (False, False, False))[2]:
@@ -2751,11 +3602,19 @@ class Deadgrid:
             self._click(point, event.button)
         elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
             self.mouse = self._screen_position(event)
+            if self.screen_name == "menu" and self.world_pan_drag:
+                if not self.world_pan_moved and self._world_map_rect().collidepoint(self.mouse):
+                    self._select_world_location(self.mouse)
+                self.world_pan_drag = False
             self.dragging_radius = False
             if self.barricade_drag_start is not None:
                 self._finish_barricade_drag(self.mouse)
         elif event.type == pygame.MOUSEBUTTONUP and event.button == 3:
             self.area_pan_drag = False
+            self.world_pan_drag = False
+        elif event.type == pygame.MOUSEWHEEL and self.screen_name == "menu":
+            if self._world_map_rect().collidepoint(self.mouse):
+                self._zoom_world(event.y, self.mouse)
         elif event.type == pygame.MOUSEWHEEL and self.screen_name == "area_select":
             if self._area_content_rect().collidepoint(self.mouse):
                 self._zoom_area(1.2 ** event.y, self.mouse)
@@ -2784,11 +3643,15 @@ class Deadgrid:
                     self.scenario_name += event.unicode
             elif self.screen_name == "menu" and self.input_active:
                 if event.key == pygame.K_RETURN:
-                    self._request_map()
+                    self._search_places()
                 elif event.key == pygame.K_BACKSPACE:
                     self.place_input = self.place_input[:-1]
+                    self.search_results.clear()
+                    self.search_loading = False
                 elif event.unicode and event.unicode.isprintable() and len(self.place_input) < 90:
                     self.place_input += event.unicode
+                    self.search_results.clear()
+                    self.search_loading = False
             elif self.screen_name == "area_select":
                 if event.key == pygame.K_ESCAPE:
                     self.screen_name = "menu"
@@ -2842,6 +3705,24 @@ class Deadgrid:
 
     def _render(self) -> None:
         self.hit_targets = {}
+        width, height = self.screen.get_size()
+        scale = min(width / WIDTH, height / HEIGHT)
+        target_w, target_h = round(WIDTH * scale), round(HEIGHT * scale)
+        offset_x, offset_y = (width - target_w) / 2, (height - target_h) / 2
+        old_canvas = self.canvas
+        if self.canvas.get_size() != (width, height):
+            self.canvas = pygame.Surface((width, height))
+            _SURFACE_TRANSFORMS.pop(old_canvas, None)
+        self.render_scale = scale
+        self.render_offset = (offset_x, offset_y)
+        transform = (scale, scale, offset_x, offset_y)
+        _SURFACE_TRANSFORMS[self.canvas] = transform
+        if scale != self._rendered_scale:
+            self._scaled_font_cache.clear()
+            self.world_tile_render_cache.clear()
+            if self.screen_name in ("deployment", "active") and hasattr(self, "intel_grids"):
+                self._refresh_intelligence(self.intel_grids)
+        self._rendered_scale = scale
         if self.screen_name == "menu":
             self._draw_menu()
         elif self.screen_name == "area_select":
@@ -2854,16 +3735,7 @@ class Deadgrid:
             self._draw_operation(True)
         elif self.screen_name == "analysis":
             self._draw_analysis()
-        width, height = self.screen.get_size()
-        scale = min(width / WIDTH, height / HEIGHT)
-        target_w, target_h = int(WIDTH * scale), int(HEIGHT * scale)
-        self.screen.fill((5, 9, 10))
-        destination = ((width - target_w) // 2, (height - target_h) // 2)
-        if (target_w, target_h) == self.canvas.get_size():
-            self.screen.blit(self.canvas, destination)
-        else:
-            frame = pygame.transform.scale(self.canvas, (target_w, target_h))
-            self.screen.blit(frame, destination)
+        self.screen.blit(self.canvas, (0, 0))
         pygame.display.flip()
 
     def run(self) -> None:
@@ -2916,26 +3788,30 @@ def self_test() -> None:
         road_surface = pygame.Surface((WIDTH, HEIGHT))
         road_test._draw_city(road_surface, MAP_RECT, road_test.city)
         sample_x, sample_y = road_test._map_point(0.5, 0.5)
-        return sum(road_surface.get_at((sample_x, y))[:3] == (224, 225, 204) for y in range(sample_y - 12, sample_y + 13))
+        return sum(road_surface.get_at((sample_x, y))[:3] == MAP_ROAD for y in range(sample_y - 12, sample_y + 13))
 
     assert road_pixel_width(15, 2) > road_pixel_width(5, 2) > road_pixel_width(5, 4)
     layer_city = CityMap(
         "Layer order test",
         roads=[[(0.1, 0.5), (0.9, 0.5)]],
         road_types=["primary"],
-        buildings=[[(0.3, 0.3), (0.7, 0.3), (0.7, 0.7), (0.3, 0.7)]],
+        buildings=[
+            [(0.3, 0.3), (0.7, 0.3), (0.7, 0.7), (0.3, 0.7)],
+            [(0.74, 0.3), (0.88, 0.3), (0.88, 0.42), (0.74, 0.42)],
+        ],
         water=[[(0.05, 0.05), (0.2, 0.05), (0.2, 0.2), (0.05, 0.2), (0.05, 0.05)]],
         waterways=[[(0.1, 0.75), (0.5, 0.65), (0.9, 0.75)]],
-        building_types=["civic"],
+        building_types=["civic", "industrial"],
     )
     layer_test._draw_city(layer_surface, MAP_RECT, layer_city)
     road_pixel = layer_surface.get_at(layer_test._map_point(0.8, 0.5))[:3]
     building_pixel = layer_surface.get_at(layer_test._map_point(0.34, 0.34))[:3]
     road_building_crossing = layer_surface.get_at(layer_test._map_point(0.5, 0.5))[:3]
+    second_building_pixel = layer_surface.get_at(layer_test._map_point(0.78, 0.34))[:3]
     water_pixel = layer_surface.get_at(layer_test._map_point(0.1, 0.1))[:3]
-    assert road_pixel in {(107, 122, 119), (211, 210, 185), (169, 151, 108)}
-    assert building_pixel == (224, 181, 158) and road_building_crossing == building_pixel
-    assert water_pixel == (91, 153, 166)
+    assert road_pixel == MAP_ROAD
+    assert building_pixel == MAP_BUILDING == second_building_pixel and road_building_crossing == building_pixel
+    assert water_pixel == MAP_WATER
     assert layer_surface.get_at(layer_test._map_point(0.5, 0.75))[:3] == MAP_BASE
     layer_test.intel_modes = {mode: True for mode in ("risk", "horde", "exposed", "survivors")}
     layer_test.intel_layers = {mode: pygame.Surface(layer_test._map_content_rect().size, pygame.SRCALPHA) for mode in layer_test.intel_modes}
@@ -2982,10 +3858,56 @@ def self_test() -> None:
     assert 'relation["natural"="water"]' in overpass_query and 'way["natural"="coastline"]' in overpass_query
     assert len(fetched_water.water) == 1 and fetched_water.water[0][0] == fetched_water.water[0][-1]
     assert len(fetched_water.waterways) == 2
+    assert fetched_water.waterway_blocked == [True, True]
     assert fetched_water.road_widths_m == [18.0]
     cropped_water = crop_game._select_city_area(fetched_water, (0.5, 0.5), 1.0)
     assert cropped_water.waterways and all(line[0] != line[-1] for line in cropped_water.waterways)
+    assert cropped_water.waterway_blocked == fetched_water.waterway_blocked
     assert cropped_water.road_widths_m == [18.0]
+
+    building_collision = Deadgrid()
+    building_collision._prepare_collision_grid(CityMap(
+        "Building collision",
+        buildings=[[(0.48, 0.0), (0.52, 0.0), (0.52, 1.0), (0.48, 1.0)]],
+        map_width_km=1.0,
+        map_height_km=0.7,
+    ))
+    agent_x = np.array([400.0], dtype=np.float32)
+    agent_y = np.array([350.0], dtype=np.float32)
+    building_collision._move_with_collision(agent_x, agent_y, np.array([200.0]), np.array([0.0]))
+    assert agent_x[0] == 400.0
+    blocked_spawn_x = np.array([500.0], dtype=np.float32)
+    blocked_spawn_y = np.array([350.0], dtype=np.float32)
+    building_collision._resolve_blocked_positions(blocked_spawn_x, blocked_spawn_y)
+    assert not building_collision._blocked_at(blocked_spawn_x, blocked_spawn_y)[0]
+
+    major_water_collision = Deadgrid()
+    major_water_collision._prepare_collision_grid(CityMap(
+        "Major water collision",
+        waterways=[[(0.5, 0.0), (0.5, 1.0)]],
+        waterway_blocked=[True],
+        waterway_widths_m=[35.0],
+        map_width_km=1.0,
+        map_height_km=0.7,
+    ))
+    agent_x = np.array([400.0], dtype=np.float32)
+    agent_y = np.array([350.0], dtype=np.float32)
+    major_water_collision._move_with_collision(agent_x, agent_y, np.array([200.0]), np.array([0.0]))
+    assert agent_x[0] == 400.0
+
+    creek_collision = Deadgrid()
+    creek_collision._prepare_collision_grid(CityMap(
+        "Small creek collision",
+        waterways=[[(0.5, 0.0), (0.5, 1.0)]],
+        waterway_blocked=[False],
+        waterway_widths_m=[2.5],
+        map_width_km=1.0,
+        map_height_km=0.7,
+    ))
+    agent_x = np.array([400.0], dtype=np.float32)
+    agent_y = np.array([350.0], dtype=np.float32)
+    creek_collision._move_with_collision(agent_x, agent_y, np.array([200.0]), np.array([0.0]))
+    assert agent_x[0] == 600.0
     geo_preview = CityMap(
         "Geographic crop test",
         roads=[[(0.0, 0.5), (1.0, 0.5)]],
@@ -3011,9 +3933,60 @@ def self_test() -> None:
     assert all(0 <= x <= 1 and 0 <= y <= 1 for road in offline_crop.roads for x, y in road)
 
     menu_game = Deadgrid()
+    menu_game.tile_worker.request = Mock()
     assert menu_game.screen.get_size() == (NATIVE_WIDTH, NATIVE_HEIGHT)
     menu_game._render()
-    assert not menu_game.hit_targets["build_plan"].colliderect(menu_game.hit_targets["config"])
+    assert menu_game.canvas.get_size() == menu_game.screen.get_size()
+    assert not menu_game.hit_targets["start_operation"].colliderect(menu_game.hit_targets["config"])
+    assert menu_game.hit_targets["place_input"] and menu_game.hit_targets["search_places"]
+    place = PlaceSearchResult(
+        "Paris, France",
+        48.8566,
+        2.3522,
+        (2.224, 48.815, 2.469, 48.902),
+        2_100_000,
+    )
+    menu_game._focus_place(place)
+    assert menu_game.world_center == (place.latitude, place.longitude)
+    assert menu_game.selected_place == place and menu_game._selected_population_estimate() > 0
+    menu_game.place_input = "Paris"
+    menu_game.search_query = "Paris"
+    menu_game.search_loading = True
+    menu_game.worker.place_results.put(("Paris", [place], None))
+    menu_game._update(0)
+    assert not menu_game.search_loading and menu_game.search_results == [place]
+    menu_game._render()
+    menu_game._click(menu_game.hit_targets["place_result_0"].center, 1)
+    assert menu_game.world_center == (place.latitude, place.longitude)
+    anchor = (menu_game._world_map_rect().centerx + 170, menu_game._world_map_rect().centery - 90)
+    anchor_geo_before = menu_game._world_geo_at_point(anchor)
+    menu_game._zoom_world(1, anchor)
+    anchor_geo_after = menu_game._world_geo_at_point(anchor)
+    assert np.allclose(anchor_geo_before, anchor_geo_after, atol=1e-8)
+    menu_game._render()
+    center_point = menu_game._world_map_rect().center
+    physical_center = menu_game._physical_point(center_point)
+    menu_game._handle_event(pygame.event.Event(pygame.MOUSEBUTTONDOWN, {"pos": physical_center, "button": 1}))
+    menu_game._handle_event(pygame.event.Event(pygame.MOUSEBUTTONUP, {"pos": physical_center, "button": 1}))
+    assert menu_game.selected_place is not None
+    assert math.isclose(menu_game.selected_latitude, menu_game.world_center[0], abs_tol=1e-7)
+    menu_game.worker.request = Mock()
+    menu_game._start_operation_from_world_map()
+    assert menu_game.loading and menu_game.loading_operation
+    request_args, kwargs = menu_game.worker.request.call_args
+    assert kwargs["center"] == (menu_game.selected_latitude, menu_game.selected_longitude)
+    assert request_args[3] >= menu_game.radius_km
+    operation_preview = schematic_map("World map operation test", 11)
+    operation_preview.population = 400
+    menu_game.worker.results.put(operation_preview)
+    menu_game._update(0)
+    assert menu_game.screen_name == "deployment" and not menu_game.loading
+    menu_game._handle_event(pygame.event.Event(pygame.KEYDOWN, {"key": pygame.K_F10}))
+    menu_game._render()
+    assert menu_game.canvas.get_size() == menu_game.screen.get_size() == menu_game.windowed_size
+    menu_game._handle_event(pygame.event.Event(pygame.KEYDOWN, {"key": pygame.K_F10}))
+    menu_game._render()
+    assert menu_game.canvas.get_size() == menu_game.screen.get_size() == (NATIVE_WIDTH, NATIVE_HEIGHT)
 
     selection_game = Deadgrid()
     selection_game.worker.results.put(offline_preview)
@@ -3043,6 +4016,9 @@ def self_test() -> None:
     selection_game._handle_event(pygame.event.Event(pygame.KEYDOWN, {"key": pygame.K_PLUS, "unicode": "+"}))
     assert selection_game.area_zoom > keyboard_zoom
     selection_game._render()
+    selection_game.area_zoom = 4.0
+    selection_game._render()
+    assert selection_game.area_map_scale >= math.ceil(selection_game.render_scale * selection_game.area_zoom)
     selection_game._click(selection_game.hit_targets["area_confirm"].center, 1)
     assert selection_game.screen_name == "deployment"
 
@@ -3144,6 +4120,21 @@ def self_test() -> None:
     def unavailable_overpass(*args: Any, **kwargs: Any) -> None:
         raise requests.ConnectionError("offline test")
 
+    with patch("deadgrid.requests.get", return_value=GeocodeResponse()):
+        found_places = search_places("Eiffel Tower")
+    assert len(found_places) == 1 and found_places[0].bounds == (2.28, 48.85, 2.31, 48.87)
+    with patch("deadgrid.requests.get", side_effect=AssertionError("Coordinate loads must not geocode")), patch("deadgrid.requests.post", side_effect=unavailable_overpass), patch.object(sys.modules[__name__], "_add_overture_buildings", return_value=False):
+        coordinate_city = load_city(
+            "Paris, France",
+            use_overture=False,
+            radius_km=1.0,
+            center=(48.8584, 2.2945),
+            place_bounds=found_places[0].bounds,
+            place_population=12_000,
+        )
+    assert coordinate_city.center == (48.8584, 2.2945) and coordinate_city.place_population == 12_000
+    assert coordinate_city.population > 0
+
     def overture_footprint(target: CityMap, bounds: tuple[float, float, float, float]) -> bool:
         target.buildings.append([(0.45, 0.45), (0.55, 0.45), (0.55, 0.55), (0.45, 0.55)])
         target.building_weights.append(8.0)
@@ -3161,6 +4152,7 @@ def self_test() -> None:
     assert len(fallback_city.buildings) == len(fallback_city.building_weights) > 0
 
     config_game = Deadgrid()
+    config_game.tile_worker.request = Mock()
     config_game._render()
     config_game._click(config_game.hit_targets["config"].center, 1)
     config_game._render()
@@ -3174,13 +4166,14 @@ def self_test() -> None:
         scenario_game = Deadgrid()
         assert len(scenario_game.saved_scenarios) == 1
         scenario_game.selected_scenario_index = 0
-        with patch.object(scenario_game, "_request_map") as map_request:
+        with patch.object(scenario_game, "_search_places") as place_search:
             scenario_game._load_selected_scenario()
         assert scenario_game.population_density == 1.5 and scenario_game.zombie_behavior == "RUNNER"
         assert scenario_game.starting_resources == 2500 and not scenario_game.auto_collapse
-        assert map_request.called
+        assert place_search.called
 
     game = Deadgrid()
+    game.tile_worker.request = Mock()
     game._render()
     slider = game.hit_targets["radius_slider"]
     game._click((slider.right - 1, slider.centery), 1)
@@ -3292,11 +4285,21 @@ def self_test() -> None:
     assert game.target_mode == "origin"
     game._click(game._map_point(0.25, 1 / 3), 1)
     assert game.infection_origin == (0.25, 1 / 3) and len(game.zombies["x"]) == round(game.population_agents * 0.05)
-    game._draw_map_overlay(game.canvas)
-    civilian_point = game._map_point(game.civilians["x"][0] / WORLD_W, game.civilians["y"][0] / WORLD_H)
-    zombie_point = game._map_point(game.zombies["x"][0] / WORLD_W, game.zombies["y"][0] / WORLD_H)
-    assert game.canvas.get_at(civilian_point)[:3] == (250, 250, 242)
-    assert game.canvas.get_at(zombie_point)[:3] == LIME
+    game.civilians = {
+        "x": np.array([250.0], dtype=np.float32),
+        "y": np.array([200.0], dtype=np.float32),
+        "status": np.array([0], dtype=np.uint8),
+    }
+    game.zombies = {
+        "x": np.array([750.0], dtype=np.float32),
+        "y": np.array([500.0], dtype=np.float32),
+    }
+    game.canvas.fill(INK)
+    game._draw_population(game.canvas)
+    civilian_point = game._map_point(0.25, 200 / WORLD_H)
+    zombie_point = game._map_point(0.75, 500 / WORLD_H)
+    assert game.canvas.get_at(game._physical_point(civilian_point))[:3] == (250, 250, 242)
+    assert game.canvas.get_at(game._physical_point(zombie_point))[:3] == LIME
     game._begin_operation(CityMap("Dense test area", population=10000))
     assert game.zombies["x"][0] and len(game.zombies["x"]) == round(game.population_agents * 0.05)
 
@@ -3311,7 +4314,7 @@ def self_test() -> None:
     )
     density_game = Deadgrid()
     density_game._begin_operation(density_city)
-    residential = ((density_game.civilians["x"] / WORLD_W >= 0.1) & (density_game.civilians["x"] / WORLD_W <= 0.2) & (density_game.civilians["y"] / WORLD_H >= 0.1) & (density_game.civilians["y"] / WORLD_H <= 0.2))
+    residential = ((density_game.civilians["x"] / WORLD_W >= 0.09) & (density_game.civilians["x"] / WORLD_W <= 0.21) & (density_game.civilians["y"] / WORLD_H >= 0.09) & (density_game.civilians["y"] / WORLD_H <= 0.21))
     assert np.count_nonzero(residential) / len(residential) > 0.98
 
     spread_game = Deadgrid()
@@ -3364,6 +4367,8 @@ def self_test() -> None:
     assert game.target_mode == "move"
     game._click((MAP_RECT.x + 100, MAP_RECT.y + 100), 1)
     assert game.target_mode is None and game.units[0]["x"] < 200
+    assert game.city_surface_cache
+    assert max(surface.get_width() for surface in game.city_surface_cache.values()) >= round(MAP_RECT.w * game.render_scale)
     evacuation = Deadgrid()
     evacuation._begin_operation(city)
     evacuation.zombies = {"x": np.array([100000.0], dtype=np.float32), "y": np.array([100000.0], dtype=np.float32), "hp": np.array([40.0], dtype=np.float32)}
