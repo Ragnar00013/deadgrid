@@ -1,0 +1,4 @@
+__pycache__/
+*.py[cod]
+deadgrid_save.json
+deadgrid_scenarios.json

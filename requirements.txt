@@ -1,0 +1,5 @@
+pygame-ce>=2.5
+numpy>=1.26
+requests>=2.31
+overturemaps>=0.16
+geopandas>=1.0
